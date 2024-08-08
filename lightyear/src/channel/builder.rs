@@ -19,6 +19,7 @@ use crate::channel::stats::send::ChannelSendStats;
 use crate::prelude::ChannelKind;
 
 /// A ChannelContainer is a struct that implements the [`Channel`] trait
+#[derive(Debug)]
 pub struct ChannelContainer {
     pub setting: ChannelSettings,
     pub(crate) receiver: ChannelReceiver,
@@ -122,7 +123,6 @@ pub struct ChannelSettings {
     /// How often should we try to send messages on this channel.
     /// Set to `Duration::default()` to send messages every frame if possible.
     pub send_frequency: Duration,
-    pub direction: ChannelDirection,
     /// Sets the priority of the channel. The final priority of a message will be `MessagePriority * ChannelPriority`
     pub priority: f32,
 }
@@ -132,7 +132,6 @@ impl Default for ChannelSettings {
         Self {
             mode: ChannelMode::UnorderedUnreliable,
             send_frequency: Duration::default(),
-            direction: ChannelDirection::Bidirectional,
             priority: 1.0,
         }
     }

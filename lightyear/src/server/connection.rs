@@ -1,9 +1,9 @@
 //! Specify how a Server sends/receives messages with a Client
 use bevy::ecs::component::Tick as BevyTick;
-use bevy::ecs::entity::EntityHash;
+use bevy::ecs::entity::{EntityHash, MapEntities};
 use bevy::prelude::{Component, Entity, Mut, Resource, World};
 use bevy::ptr::Ptr;
-use bevy::utils::{Duration, HashMap, HashSet};
+use bevy::utils::{Duration, HashMap};
 use bytes::Bytes;
 use hashbrown::hash_map::Entry;
 use tracing::{debug, info, info_span, trace, trace_span};
@@ -39,13 +39,13 @@ use crate::server::config::PacketConfig;
 use crate::server::error::ServerError;
 use crate::server::events::{ConnectEvent, ServerEvents};
 use crate::server::relevance::error::RelevanceError;
-use crate::server::replication::send::ReplicateCache;
 use crate::shared::events::connection::ConnectionEvents;
 use crate::shared::message::MessageSend;
 use crate::shared::ping::manager::{PingConfig, PingManager};
 use crate::shared::ping::message::{Ping, Pong};
 use crate::shared::replication::components::ReplicationGroupId;
 use crate::shared::replication::delta::DeltaManager;
+use crate::shared::replication::entity_map::EntityMap;
 use crate::shared::replication::network_target::NetworkTarget;
 use crate::shared::replication::receive::ReplicationReceiver;
 use crate::shared::replication::send::ReplicationSender;
@@ -64,12 +64,7 @@ pub struct ConnectionManager {
     pub(crate) message_registry: MessageRegistry,
     channel_registry: ChannelRegistry,
     pub(crate) events: ServerEvents,
-    pub(crate) delta_manager: DeltaManager,
-
-    // NOTE: we put this here because we only need one per world, not one per connection
-    /// Stores some values that are needed to correctly replicate the despawning of Replicated entity.
-    /// (when the entity is despawned, we don't have access to its components anymore, so we cache them here)
-    pub(crate) replicate_component_cache: EntityHashMap<Entity, ReplicateCache>,
+    pub delta_manager: DeltaManager,
 
     // list of clients that connected since the last time we sent replication messages
     // (we want to keep track of them because we need to replicate the entire world state to them)
@@ -109,7 +104,6 @@ impl ConnectionManager {
             channel_registry,
             events: ServerEvents::new(),
             delta_manager: DeltaManager::default(),
-            replicate_component_cache: EntityHashMap::default(),
             new_clients: vec![],
             writer: Writer::with_capacity(MAX_PACKET_SIZE),
             replication_config,
@@ -126,6 +120,22 @@ impl ConnectionManager {
     /// Return the list of connected [`ClientId`]s
     pub fn connected_clients(&self) -> impl Iterator<Item = ClientId> + '_ {
         self.connections.keys().copied()
+    }
+
+    // TODO: we need `&mut self` because MapEntities requires `&mut EntityMapper` even though it's not needed here
+    /// Convert entities in the message to be compatible with the remote world of the provided client
+    pub fn map_entities_to_remote<M: Message + MapEntities>(
+        &mut self,
+        message: &mut M,
+        client_id: ClientId,
+    ) -> Result<(), ServerError> {
+        let mapper = &mut self
+            .connection_mut(client_id)?
+            .replication_receiver
+            .remote_entity_map
+            .local_to_remote;
+        message.map_entities(mapper);
+        Ok(())
     }
 
     /// Queues up a message to be sent to all clients matching the specific [`NetworkTarget`]
@@ -157,7 +167,7 @@ impl ConnectionManager {
         client_id: ClientId,
         message: &M,
     ) -> Result<(), ServerError> {
-        self.send_message_to_target::<C, M>(message, NetworkTarget::Only(vec![client_id]))
+        self.send_message_to_target::<C, M>(message, NetworkTarget::Single(client_id))
     }
 
     /// Update the priority of a `ReplicationGroup` that is replicated to a given client
@@ -179,24 +189,28 @@ impl ConnectionManager {
         Ok(())
     }
 
-    /// Find the list of clients that should receive the replication message
-    pub(crate) fn apply_replication(
-        &mut self,
+    /// Find the list of connected clients that match the provided [`NetworkTarget`]
+    pub(crate) fn connected_targets(
+        &self,
         target: NetworkTarget,
     ) -> Box<dyn Iterator<Item = ClientId>> {
-        let connected_clients = self.connections.keys().copied().collect::<Vec<_>>();
+        // TODO: avoid extra allocations ...
         match target {
             NetworkTarget::All => {
                 // TODO: maybe only send stuff when the client is time-synced ?
+                let connected_clients = self.connections.keys().copied().collect::<Vec<_>>();
                 Box::new(connected_clients.into_iter())
             }
-            NetworkTarget::AllExceptSingle(client_id) => Box::new(
-                connected_clients
-                    .into_iter()
-                    .filter(move |id| *id != client_id),
-            ),
+            NetworkTarget::AllExceptSingle(client_id) => {
+                let connected_clients = self.connections.keys().copied().collect::<Vec<_>>();
+                Box::new(
+                    connected_clients
+                        .into_iter()
+                        .filter(move |id| *id != client_id),
+                )
+            }
             NetworkTarget::AllExcept(client_ids) => {
-                let client_ids: HashSet<ClientId> = HashSet::from_iter(client_ids);
+                let connected_clients = self.connections.keys().copied().collect::<Vec<_>>();
                 Box::new(
                     connected_clients
                         .into_iter()
@@ -210,11 +224,14 @@ impl ConnectionManager {
                     Box::new(std::iter::empty())
                 }
             }
-            NetworkTarget::Only(client_ids) => Box::new(
-                connected_clients
-                    .into_iter()
-                    .filter(move |id| client_ids.contains(id)),
-            ),
+            NetworkTarget::Only(client_ids) => {
+                let connected_clients = self.connections.keys().copied().collect::<Vec<_>>();
+                Box::new(
+                    connected_clients
+                        .into_iter()
+                        .filter(move |id| client_ids.contains(id)),
+                )
+            }
             NetworkTarget::None => Box::new(std::iter::empty()),
         }
     }
@@ -253,9 +270,9 @@ impl ConnectionManager {
                 client_id,
                 client_entity,
                 &self.channel_registry,
-                self.replication_config.clone(),
-                self.packet_config.clone(),
-                self.ping_config.clone(),
+                self.replication_config,
+                self.packet_config,
+                self.ping_config,
             );
             self.events.add_connect_event(ConnectEvent {
                 client_id,
@@ -294,7 +311,16 @@ impl ConnectionManager {
             .iter_mut()
             .filter(|(id, _)| target.targets(id))
             // NOTE: this clone is O(1), it just increments the reference count
-            .try_for_each(|(_, c)| c.buffer_message(message.clone(), channel))
+            .try_for_each(|(_, c)| {
+                // for local clients, we don't want to buffer messages in the MessageManager since
+                // there is no io
+                if c.is_local_client() {
+                    c.local_messages_to_send.push(message.clone())
+                } else {
+                    c.buffer_message(message.clone(), channel)?;
+                }
+                Ok::<(), ServerError>(())
+            })
     }
 
     pub(crate) fn erased_send_message_to_target<M: Message>(
@@ -408,6 +434,10 @@ pub struct Connection {
     writer: Writer,
     // messages that we have received that need to be rebroadcasted to other clients
     pub(crate) messages_to_rebroadcast: Vec<(Bytes, NetworkTarget, ChannelKind)>,
+    /// True if this connection corresponds to a local client when running in host-server mode
+    is_local_client: bool,
+    /// Messages to send to the local client (we don't buffer them in the MessageManager because there is no io)
+    pub(crate) local_messages_to_send: Vec<Bytes>,
 }
 
 impl Connection {
@@ -459,7 +489,24 @@ impl Connection {
             received_leafwing_input_messages: HashMap::default(),
             writer: Writer::with_capacity(MAX_PACKET_SIZE),
             messages_to_rebroadcast: vec![],
+            is_local_client: false,
+            local_messages_to_send: vec![],
         }
+    }
+
+    /// Update the connection to make clear that it corresponds to the local client
+    pub(crate) fn set_local_client(&mut self) {
+        self.is_local_client = true;
+    }
+
+    /// Returns true if this connection corresponds to the local client in HostServer mode
+    pub(crate) fn is_local_client(&self) -> bool {
+        self.is_local_client
+    }
+
+    /// Map from the local entities to the remote entities
+    pub fn local_to_remote_map(&mut self) -> &mut EntityMap {
+        &mut self.replication_receiver.remote_entity_map.local_to_remote
     }
 
     /// Return the latest estimate of rtt
@@ -478,6 +525,9 @@ impl Connection {
         time_manager: &TimeManager,
         tick_manager: &TickManager,
     ) {
+        if self.is_local_client() {
+            return;
+        }
         self.message_manager
             .update(time_manager, &self.ping_manager, tick_manager);
         self.replication_sender.update(world_tick);
@@ -625,6 +675,9 @@ impl Connection {
                         // buffer the replication message
                         self.replication_receiver.recv_updates(updates, tick);
                     } else {
+                        // TODO: THIS IS DUPLICATED FROM THE `receive_message` FUNCTION BUT THERE ARE BORROW CHECKER
+                        //  BECAUSE SPLIT BORROWS ARE NOT WELL HANDLED!
+
                         // TODO: we only get RawData here, does that mean we're deserializing multiple times?
                         //  instead just read the bytes for the target!!
                         let ClientMessage { message, target } =
@@ -639,8 +692,7 @@ impl Connection {
                         //  I don't think so... maybe the sender should map_entities themselves?
                         //  or it matters for input messages?
                         // TODO: avoid clone with Arc<[u8]>?
-                        let data = (reader.consume(), target.clone(), *channel_kind);
-
+                        let data = (reader.consume(), target, *channel_kind);
                         match message_registry.message_type(net_id) {
                             #[cfg(feature = "leafwing")]
                             MessageType::LeafwingInput => self
@@ -678,6 +730,49 @@ impl Connection {
         Ok(std::mem::replace(&mut self.events, ConnectionEvents::new()))
     }
 
+    /// Receive bytes for a single message.
+    ///
+    /// Adds them to an internal buffer, so that we can decode them into the correct type.
+    pub(crate) fn receive_message(
+        &mut self,
+        mut reader: Reader,
+        channel_kind: ChannelKind,
+        message_registry: &MessageRegistry,
+    ) -> Result<(), SerializationError> {
+        // TODO: we only get RawData here, does that mean we're deserializing multiple times?
+        //  instead just read the bytes for the target!!
+        let ClientMessage { message, target } = ClientMessage::from_bytes(&mut reader)?;
+
+        let mut reader = Reader::from(message);
+        let net_id = NetId::from_bytes(&mut reader)?;
+        // we are also sending target and channel kind so the message can be
+        // rebroadcasted to other clients after we have converted the entities from the
+        // client World to the server World
+        // TODO: but do we have data to convert the entities from the client to the server?
+        //  I don't think so... maybe the sender should map_entities themselves?
+        //  or it matters for input messages?
+        // TODO: avoid clone with Arc<[u8]>?
+        let data = (reader.consume(), target, channel_kind);
+        match message_registry.message_type(net_id) {
+            #[cfg(feature = "leafwing")]
+            MessageType::LeafwingInput => self
+                .received_leafwing_input_messages
+                .entry(net_id)
+                .or_default()
+                .push(data),
+            MessageType::NativeInput => {
+                self.received_input_messages
+                    .entry(net_id)
+                    .or_default()
+                    .push(data);
+            }
+            MessageType::Normal => {
+                self.received_messages.entry(net_id).or_default().push(data);
+            }
+        }
+        Ok(())
+    }
+
     pub fn recv_packet(
         &mut self,
         packet: RecvPayload,
@@ -702,7 +797,7 @@ impl ConnectionManager {
         group_id: ReplicationGroupId,
         target: NetworkTarget,
     ) -> Result<(), ServerError> {
-        self.apply_replication(target).try_for_each(|client_id| {
+        self.connected_targets(target).try_for_each(|client_id| {
             // trace!(
             //     ?entity,
             //     ?client_id,
@@ -725,7 +820,7 @@ impl ConnectionManager {
     ) -> Result<(), ServerError> {
         let group_id = group.group_id(Some(entity));
         debug!(?entity, ?kind, "Sending RemoveComponent");
-        self.apply_replication(target).try_for_each(|client_id| {
+        self.connected_targets(target).try_for_each(|client_id| {
             // TODO: I don't think it's actually correct to only correct the changes since that action.
             //  what if we do:
             //  - Frame 1: update is ACKED
@@ -804,7 +899,7 @@ impl ConnectionManager {
             component_registry.erased_serialize(component_data, &mut self.writer, kind)?;
         };
         let raw_data = self.writer.split();
-        self.apply_replication(actual_target)
+        self.connected_targets(actual_target)
             .try_for_each(|client_id| {
                 // trace!(
                 //     ?entity,
@@ -844,7 +939,7 @@ impl ConnectionManager {
     ) -> Result<(), ServerError> {
         let mut num_targets = 0;
         let mut existing_bytes: Option<Bytes> = None;
-        self.apply_replication(target).try_for_each(|client_id| {
+        self.connected_targets(target).try_for_each(|client_id| {
             // TODO: should we have additional state tracking so that we know we are in the process of sending this entity to clients?
             let replication_sender = &mut self.connections.get_mut(&client_id).ok_or(ServerError::ClientIdNotFound(client_id))?.replication_sender;
             let send_tick = replication_sender
@@ -948,7 +1043,6 @@ impl ReplicationReceive for ConnectionManager {
 
 impl ReplicationSend for ConnectionManager {
     type Error = ServerError;
-    type ReplicateCache = EntityHashMap<Entity, ReplicateCache>;
 
     fn writer(&mut self) -> &mut Writer {
         &mut self.writer

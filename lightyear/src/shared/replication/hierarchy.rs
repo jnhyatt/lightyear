@@ -1,10 +1,12 @@
 //! This module is responsible for making sure that parent-children hierarchies are replicated correctly.
+use crate::client::prediction::pre_prediction::PrePredictionSet;
+use crate::client::replication::send::ReplicateToServer;
 use bevy::ecs::entity::MapEntities;
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::prelude::server::ControlledBy;
-use crate::prelude::{NetworkRelevanceMode, Replicating, ReplicationGroup};
+use crate::prelude::{MainSet, NetworkRelevanceMode, PrePredicted, Replicating, ReplicationGroup};
 use crate::server::replication::send::SyncTarget;
 use crate::shared::replication::components::{ReplicateHierarchy, ReplicationTarget};
 use crate::shared::replication::{ReplicationPeer, ReplicationSend};
@@ -17,7 +19,6 @@ use crate::shared::sets::{InternalMainSet, InternalReplicationSet};
 /// Updates entity's `Parent` component on change.
 /// Removes the parent if `None`.
 #[derive(Component, Default, Reflect, Clone, Copy, Serialize, Deserialize, Debug, PartialEq)]
-#[component(storage = "SparseSet")]
 pub struct ParentSync(Option<Entity>);
 
 impl MapEntities for ParentSync {
@@ -49,38 +50,67 @@ impl<R: ReplicationSend> HierarchySendPlugin<R> {
             (
                 Entity,
                 Ref<ReplicateHierarchy>,
-                &ReplicationTarget,
+                Option<&PrePredicted>,
+                Option<&ReplicationTarget>,
+                Option<&ReplicateToServer>,
                 Option<&SyncTarget>,
                 Option<&ControlledBy>,
                 Option<&NetworkRelevanceMode>,
             ),
-            (Without<Parent>, With<Children>),
+            (
+                Without<Parent>,
+                With<Children>,
+                Or<(Changed<Children>, Changed<ReplicateHierarchy>)>,
+            ),
         >,
         children_query: Query<&Children>,
+        child_query: Query<(), (With<ParentSync>, With<Replicating>)>,
     ) {
         for (
             parent_entity,
             replicate_hierarchy,
+            pre_predicted,
             replication_target,
+            replicate_to_server,
             sync_target,
             controlled_by,
             visibility_mode,
         ) in parent_query.iter()
         {
-            if replicate_hierarchy.is_changed() && replicate_hierarchy.recursive {
+            if replicate_hierarchy.recursive {
                 // iterate through all descendents of the entity
                 for child in children_query.iter_descendants(parent_entity) {
+                    // TODO: or do we want to propagate any change of any component to the children?
+                    // if the child already has ParentSync and Replicating, we don't need to add it again
+                    if child_query.get(child).is_ok() {
+                        continue;
+                    }
                     trace!("Propagate Replicate through hierarchy: adding Replicate on child: {child:?}");
                     // no need to set the correct parent as it will be set later in the `update_parent_sync` system
                     commands.entity(child).insert((
                         // TODO: should we add replicating?
                         Replicating,
-                        replication_target.clone(),
                         // the entire hierarchy is replicated as a single group, that uses the parent's entity as the group id
                         ReplicationGroup::new_id(parent_entity.to_bits()),
                         ReplicateHierarchy { recursive: true },
                         ParentSync(None),
                     ));
+                    // On the client, we want to add the PrePredicted component to the children
+                    // The `client_entity` will be filled in a PrePrediction system
+                    // On the server, we just send the PrePredicted component as is to the client
+                    if let Some(pre_predicted) = pre_predicted {
+                        // only insert on the child if the client_entity is None (which means we
+                        // are on the client)
+                        if pre_predicted.client_entity.is_none() {
+                            commands.entity(child).insert(PrePredicted::default());
+                        }
+                    }
+                    if let Some(replication_target) = replication_target {
+                        commands.entity(child).insert(replication_target.clone());
+                    }
+                    if let Some(replicate_to_server) = replicate_to_server {
+                        commands.entity(child).insert(*replicate_to_server);
+                    }
                     if let Some(controlled_by) = controlled_by {
                         commands.entity(child).insert(controlled_by.clone());
                     }
@@ -119,26 +149,27 @@ impl<R: ReplicationSend> HierarchySendPlugin<R> {
     /// Update ParentSync if the parent has been removed
     ///
     /// This only runs on the sending side
-    fn removal_system(
-        mut removed_parents: RemovedComponents<Parent>,
+    fn handle_parent_remove(
+        trigger: Trigger<OnRemove, Parent>,
         mut hierarchy: Query<&mut ParentSync, With<ReplicateHierarchy>>,
     ) {
-        for entity in removed_parents.read() {
-            if let Ok(mut parent_sync) = hierarchy.get_mut(entity) {
-                parent_sync.0 = None;
-            }
+        if let Ok(mut parent_sync) = hierarchy.get_mut(trigger.entity()) {
+            parent_sync.0 = None;
         }
     }
 }
 
 impl<R: ReplicationSend> Plugin for HierarchySendPlugin<R> {
     fn build(&self, app: &mut App) {
+        app.observe(Self::handle_parent_remove);
         app.add_systems(
             PostUpdate,
             (
-                (Self::propagate_replicate, Self::update_parent_sync).chain(),
-                Self::removal_system,
+                // we copy PrePredicted to children before we set the correct value of the PrePredicted entity
+                Self::propagate_replicate.before(PrePredictionSet::Fill),
+                Self::update_parent_sync,
             )
+                .chain()
                 // we don't need to run these every frame, only every send_interval
                 .in_set(InternalReplicationSet::<R::SetMarker>::SendMessages)
                 // run before the replication-send systems
@@ -197,7 +228,11 @@ impl<R: ReplicationPeer> Plugin for HierarchyReceivePlugin<R> {
         // when we receive a ParentSync update from the remote, update the hierarchy
         app.add_systems(
             PreUpdate,
-            Self::update_parent.after(InternalMainSet::<R::SetMarker>::Receive),
+            Self::update_parent
+                .after(InternalMainSet::<R::SetMarker>::Receive)
+                // NOTE: we're putting this in MainSet::Receive so that users can order
+                // their systems after this
+                .in_set(MainSet::Receive),
         );
     }
 }
@@ -209,6 +244,7 @@ mod tests {
     use bevy::hierarchy::{BuildWorldChildren, Children, Parent};
     use bevy::prelude::{default, Entity, With};
 
+    use crate::prelude::client;
     use crate::prelude::server::Replicate;
     use crate::prelude::ReplicationGroup;
     use crate::shared::replication::components::ReplicateHierarchy;
@@ -218,16 +254,16 @@ mod tests {
 
     fn setup_hierarchy() -> (BevyStepper, Entity, Entity, Entity) {
         let mut stepper = BevyStepper::default();
-        let child = stepper.server_app.world.spawn(Component3(0.0)).id();
+        let child = stepper.server_app.world_mut().spawn(Component3(0.0)).id();
         let parent = stepper
             .server_app
-            .world
+            .world_mut()
             .spawn(Component2(0.0))
             .add_child(child)
             .id();
         let grandparent = stepper
             .server_app
-            .world
+            .world_mut()
             .spawn(Component1(0.0))
             .add_child(parent)
             .id();
@@ -247,12 +283,12 @@ mod tests {
         };
         stepper
             .server_app
-            .world
+            .world_mut()
             .entity_mut(parent)
             .insert((replicate.clone(), ParentSync::default()));
         stepper
             .server_app
-            .world
+            .world_mut()
             .entity_mut(grandparent)
             .insert(replicate.clone());
         stepper.frame_step();
@@ -261,29 +297,33 @@ mod tests {
         // check that the parent got replicated, along with the hierarchy information
         let client_grandparent = stepper
             .client_app
-            .world
+            .world_mut()
             .query_filtered::<Entity, With<Component1>>()
-            .get_single(&stepper.client_app.world)
+            .get_single(stepper.client_app.world())
             .unwrap();
         let (client_parent, client_parent_sync, client_parent_component) = stepper
             .client_app
-            .world
+            .world_mut()
             .query_filtered::<(Entity, &ParentSync, &Parent), With<Component2>>()
-            .get_single(&stepper.client_app.world)
+            .get_single(stepper.client_app.world())
             .unwrap();
 
         assert_eq!(client_parent_sync.0, Some(client_grandparent));
         assert_eq!(*client_parent_component.deref(), client_grandparent);
 
         // remove the hierarchy on the sender side
-        stepper.server_app.world.entity_mut(parent).remove_parent();
+        stepper
+            .server_app
+            .world_mut()
+            .entity_mut(parent)
+            .remove_parent();
         stepper.frame_step();
         stepper.frame_step();
         // 1. make sure that parent sync has been updated on the sender side
         assert_eq!(
             stepper
                 .server_app
-                .world
+                .world_mut()
                 .entity_mut(parent)
                 .get::<ParentSync>(),
             Some(&ParentSync(None))
@@ -293,7 +333,7 @@ mod tests {
         assert_eq!(
             stepper
                 .client_app
-                .world
+                .world_mut()
                 .entity_mut(client_parent)
                 .get::<ParentSync>(),
             Some(&ParentSync(None))
@@ -301,14 +341,14 @@ mod tests {
         assert_eq!(
             stepper
                 .client_app
-                .world
+                .world_mut()
                 .entity_mut(client_parent)
                 .get::<Parent>(),
             None,
         );
         assert!(stepper
             .client_app
-            .world
+            .world_mut()
             .entity_mut(client_grandparent)
             .get::<Children>()
             .is_none());
@@ -323,7 +363,7 @@ mod tests {
 
         stepper
             .server_app
-            .world
+            .world_mut()
             .entity_mut(grandparent)
             .insert(Replicate::default());
 
@@ -333,28 +373,28 @@ mod tests {
         // 1. check that the parent and child have been replicated
         let client_grandparent = stepper
             .client_app
-            .world
+            .world_mut()
             .query_filtered::<Entity, With<Component1>>()
-            .get_single(&stepper.client_app.world)
+            .get_single(stepper.client_app.world())
             .unwrap();
         let client_parent = stepper
             .client_app
-            .world
+            .world_mut()
             .query_filtered::<Entity, With<Component2>>()
-            .get_single(&stepper.client_app.world)
+            .get_single(stepper.client_app.world())
             .unwrap();
         let client_child = stepper
             .client_app
-            .world
+            .world_mut()
             .query_filtered::<Entity, With<Component3>>()
-            .get_single(&stepper.client_app.world)
+            .get_single(stepper.client_app.world())
             .unwrap();
 
         // 2. check that the hierarchies have been replicated
         assert_eq!(
             stepper
                 .client_app
-                .world
+                .world_mut()
                 .entity_mut(client_parent)
                 .get::<Parent>()
                 .unwrap()
@@ -364,7 +404,7 @@ mod tests {
         assert_eq!(
             stepper
                 .client_app
-                .world
+                .world_mut()
                 .entity_mut(client_child)
                 .get::<Parent>()
                 .unwrap()
@@ -376,7 +416,7 @@ mod tests {
         assert_eq!(
             stepper
                 .server_app
-                .world
+                .world_mut()
                 .entity_mut(parent)
                 .get::<ReplicationGroup>(),
             Some(&ReplicationGroup::new_id(grandparent.to_bits()))
@@ -384,10 +424,57 @@ mod tests {
         assert_eq!(
             stepper
                 .server_app
-                .world
+                .world_mut()
                 .entity_mut(child)
                 .get::<ReplicationGroup>(),
             Some(&ReplicationGroup::new_id(grandparent.to_bits()))
+        );
+    }
+
+    #[test]
+    fn test_propagate_hierarchy_client_to_server() {
+        let mut stepper = BevyStepper::default();
+        let child = stepper.client_app.world_mut().spawn(Component3(0.0)).id();
+        let parent = stepper
+            .client_app
+            .world_mut()
+            .spawn((Component2(0.0), client::Replicate::default()))
+            .add_child(child)
+            .id();
+
+        for _ in 0..10 {
+            stepper.frame_step();
+        }
+
+        // check that both the parent and the child were replicated
+        let server_parent = stepper
+            .server_app
+            .world_mut()
+            .query_filtered::<Entity, With<Component2>>()
+            .get_single(stepper.server_app.world())
+            .expect("parent entity was not replicated");
+        let server_child = stepper
+            .server_app
+            .world_mut()
+            .query_filtered::<Entity, With<Component3>>()
+            .get_single(stepper.server_app.world())
+            .expect("child entity was not replicated");
+        assert_eq!(
+            stepper
+                .server_app
+                .world()
+                .get::<Parent>(server_child)
+                .unwrap()
+                .get(),
+            server_parent
+        );
+        assert_eq!(
+            stepper
+                .server_app
+                .world()
+                .get::<ParentSync>(server_child)
+                .unwrap(),
+            &ParentSync(Some(server_parent))
         );
     }
 }

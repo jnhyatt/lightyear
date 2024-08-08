@@ -1,6 +1,6 @@
 //! Specify how a Client sends/receives messages with a Server
 use bevy::ecs::component::Tick as BevyTick;
-use bevy::ecs::entity::EntityHashMap;
+use bevy::ecs::entity::MapEntities;
 use bevy::prelude::{Mut, Resource, World};
 use bevy::utils::{Duration, HashMap};
 use bytes::Bytes;
@@ -12,28 +12,29 @@ use crate::channel::builder::{
 
 use crate::channel::receivers::ChannelReceive;
 use crate::channel::senders::ChannelSend;
-use crate::client::config::PacketConfig;
+use crate::client::config::ClientConfig;
 use crate::client::error::ClientError;
-use crate::client::message::ClientMessage;
-use crate::client::replication::send::ReplicateCache;
 use crate::client::sync::SyncConfig;
 use crate::connection::netcode::MAX_PACKET_SIZE;
 use crate::packet::message_manager::MessageManager;
 use crate::packet::packet_builder::{Payload, RecvPayload};
 use crate::packet::priority_manager::PriorityConfig;
+use crate::prelude::client::PredictionConfig;
 use crate::prelude::{Channel, ChannelKind, ClientId, Message, ReplicationConfig};
 use crate::protocol::channel::ChannelRegistry;
 use crate::protocol::component::ComponentRegistry;
-use crate::protocol::message::{MessageError, MessageRegistry, MessageType};
+use crate::protocol::message::{MessageRegistry, MessageType};
 use crate::protocol::registry::NetId;
 use crate::serialize::reader::Reader;
 use crate::serialize::writer::Writer;
 use crate::serialize::{SerializationError, ToBytes};
+use crate::server::error::ServerError;
 use crate::shared::events::connection::ConnectionEvents;
 use crate::shared::message::MessageSend;
 use crate::shared::ping::manager::{PingConfig, PingManager};
 use crate::shared::ping::message::{Ping, Pong};
 use crate::shared::replication::delta::DeltaManager;
+use crate::shared::replication::entity_map::EntityMap;
 use crate::shared::replication::network_target::NetworkTarget;
 use crate::shared::replication::receive::ReplicationReceiver;
 use crate::shared::replication::send::ReplicationSender;
@@ -64,7 +65,7 @@ use super::sync::SyncManager;
 ///    connection.send_message_to_target::<MyChannel, MyMessage>("Hello, server!", NetworkTarget::Single(2));
 /// }
 /// ```
-#[derive(Resource)]
+#[derive(Resource, Debug)]
 pub struct ConnectionManager {
     pub(crate) component_registry: ComponentRegistry,
     pub(crate) message_registry: MessageRegistry,
@@ -76,17 +77,18 @@ pub struct ConnectionManager {
     pub ping_manager: PingManager,
     pub(crate) sync_manager: SyncManager,
 
-    /// Stores some values that are needed to correctly replicate the despawning of Replicated entity.
-    /// (when the entity is despawned, we don't have access to its components anymore, so we cache them here)
-    pub(crate) replicate_component_cache: EntityHashMap<ReplicateCache>,
-
     /// Used to read the leafwing InputMessages from other clients
     #[cfg(feature = "leafwing")]
     pub(crate) received_leafwing_input_messages: HashMap<NetId, Vec<Bytes>>,
     /// Used to transfer raw bytes to a system that can convert the bytes to the actual type
     pub(crate) received_messages: HashMap<NetId, Vec<Bytes>>,
     pub(crate) writer: Writer,
-    // TODO: maybe don't do any replication until connection is synced?
+
+    /// Internal buffer of the messages that we want to send.
+    /// We use this so that:
+    /// - in host server mode, we deserialize the bytes and push them to the server's Message Events queue directly
+    /// - in non-host server mode, we buffer the bytes to the message manager as usual
+    pub(crate) messages_to_send: Vec<(Bytes, ChannelKind)>,
 }
 
 // NOTE: useful when we sometimes need to create a temporary fake ConnectionManager
@@ -112,13 +114,13 @@ impl Default for ConnectionManager {
             replication_sender,
             replication_receiver,
             ping_manager: PingManager::new(PingConfig::default()),
-            sync_manager: SyncManager::new(SyncConfig::default(), 0),
-            replicate_component_cache: EntityHashMap::default(),
+            sync_manager: SyncManager::new(SyncConfig::default(), PredictionConfig::default()),
             events: ConnectionEvents::default(),
             #[cfg(feature = "leafwing")]
             received_leafwing_input_messages: HashMap::default(),
             received_messages: HashMap::default(),
             writer: Writer::with_capacity(0),
+            messages_to_send: Vec::default(),
         }
     }
 }
@@ -129,18 +131,14 @@ impl ConnectionManager {
         component_registry: &ComponentRegistry,
         message_registry: &MessageRegistry,
         channel_registry: &ChannelRegistry,
-        replication_config: ReplicationConfig,
-        packet_config: PacketConfig,
-        sync_config: SyncConfig,
-        ping_config: PingConfig,
-        input_delay_ticks: u16,
+        client_config: &ClientConfig,
     ) -> Self {
-        let bandwidth_cap_enabled = packet_config.bandwidth_cap_enabled;
+        let bandwidth_cap_enabled = client_config.packet.bandwidth_cap_enabled;
         // create the message manager and the channels
         let mut message_manager = MessageManager::new(
             channel_registry,
-            packet_config.nack_rtt_multiple,
-            packet_config.into(),
+            client_config.packet.nack_rtt_multiple,
+            client_config.packet.into(),
         );
         // get notified when a replication-update message gets acked/nacked
         let entity_updates_sender = &mut message_manager
@@ -157,7 +155,7 @@ impl ConnectionManager {
             update_acks_receiver,
             update_nacks_receiver,
             replication_update_send_receiver,
-            replication_config,
+            client_config.replication,
             bandwidth_cap_enabled,
         );
         let replication_receiver = ReplicationReceiver::new();
@@ -168,14 +166,14 @@ impl ConnectionManager {
             delta_manager: DeltaManager::default(),
             replication_sender,
             replication_receiver,
-            ping_manager: PingManager::new(ping_config),
-            sync_manager: SyncManager::new(sync_config, input_delay_ticks),
-            replicate_component_cache: EntityHashMap::default(),
+            ping_manager: PingManager::new(client_config.ping),
+            sync_manager: SyncManager::new(client_config.sync, client_config.prediction),
             events: ConnectionEvents::default(),
             #[cfg(feature = "leafwing")]
             received_leafwing_input_messages: HashMap::default(),
             received_messages: HashMap::default(),
             writer: Writer::with_capacity(MAX_PACKET_SIZE),
+            messages_to_send: Vec::default(),
         }
     }
 
@@ -230,12 +228,26 @@ impl ConnectionManager {
         Ok(())
     }
 
-    /// Send a message to the server
+    // TODO: we need `&mut self` because MapEntities requires `&mut EntityMapper` even though it's not needed here
+    /// Convert entities in the message to be compatible with the remote world
+    pub fn map_entities_to_remote<M: Message + MapEntities>(&mut self, message: &mut M) {
+        let mapper = &mut self.replication_receiver.remote_entity_map.local_to_remote;
+        message.map_entities(mapper);
+    }
+
+    /// Map from the local entities to the remote entities
+    pub fn local_to_remote_map(&mut self) -> &mut EntityMap {
+        &mut self.replication_receiver.remote_entity_map.local_to_remote
+    }
+
+    /// Send a [`Message`] to the server using a specific [`Channel`]
     pub fn send_message<C: Channel, M: Message>(&mut self, message: &M) -> Result<(), ClientError> {
         self.send_message_to_target::<C, M>(message, NetworkTarget::None)
     }
 
-    /// Send a message to the server, the message should be re-broadcasted according to the `target`
+    /// Send a [`Message`] to the server using a specific [`Channel`]
+    ///
+    /// The message will be sent to the server and re-broadcasted to all clients that match the [`NetworkTarget`]
     pub fn send_message_to_target<C: Channel, M: Message>(
         &mut self,
         message: &M,
@@ -244,35 +256,22 @@ impl ConnectionManager {
         self.erased_send_message_to_target(message, ChannelKind::of::<C>(), target)
     }
 
+    /// Serialize a message and buffer it internally so that it can be sent later
     fn erased_send_message_to_target<M: Message>(
         &mut self,
         message: &M,
         channel_kind: ChannelKind,
         target: NetworkTarget,
     ) -> Result<(), ClientError> {
+        // write the target first
+        // NOTE: this is ok to do because most of the time (without rebroadcast, this just adds 1 byte)
+        target.to_bytes(&mut self.writer)?;
+        // then write the message
         self.message_registry.serialize(message, &mut self.writer)?;
         let message_bytes = self.writer.split();
-        self.buffer_message(message_bytes, channel_kind, target)
-    }
 
-    pub(crate) fn buffer_message(
-        &mut self,
-        message: Bytes,
-        channel: ChannelKind,
-        target: NetworkTarget,
-    ) -> Result<(), ClientError> {
-        // TODO: i know channel names never change so i should be able to get them as static
-        let channel_name = self
-            .message_manager
-            .channel_registry
-            .name(&channel)
-            .ok_or::<ClientError>(MessageError::NotRegistered.into())?;
-        // TODO: doesn't this serialize the bytes twice? fix this..
-        let message = ClientMessage { message, target };
-        message.to_bytes(&mut self.writer)?;
-        let message_bytes = self.writer.split();
-        // message.emit_send_logs(&channel_name);
-        self.message_manager.buffer_send(message_bytes, channel)?;
+        // TODO: emit logs/metrics about the message being buffered?
+        self.messages_to_send.push((message_bytes, channel_kind));
         Ok(())
     }
 
@@ -307,7 +306,33 @@ impl ConnectionManager {
         Ok(())
     }
 
-    /// Send packets that are ready to be sent
+    /// Send packets that are ready to be sent.
+    /// In host-server mode:
+    /// - go through messages_to_send and make the server's ConnectionManager receive them
+    pub(crate) fn send_packets_host_server(
+        &mut self,
+        local_client_id: ClientId,
+        server_manager: &mut crate::server::connection::ConnectionManager,
+    ) -> Result<(), ServerError> {
+        // go through messages_to_send, deserialize them and make the server receive them
+        self.messages_to_send
+            .drain(..)
+            .try_for_each(|(message_bytes, channel_kind)| {
+                server_manager
+                    .connection_mut(local_client_id)?
+                    .receive_message(
+                        Reader::from(message_bytes),
+                        channel_kind,
+                        &self.message_registry,
+                    )
+                    .map_err(ServerError::from)
+            })?;
+        Ok(())
+    }
+
+    /// Send packets that are ready to be sent.
+    /// In non-host-server mode:
+    /// - go through messages_to_send, buffer them to the message manager and then send packets that are ready
     pub(crate) fn send_packets(
         &mut self,
         time_manager: &TimeManager,
@@ -335,6 +360,17 @@ impl ConnectionManager {
                 self.send_pong(pong)?;
                 Ok::<(), ClientError>(())
             })?;
+
+        // buffer the messages into the message manager
+        self.messages_to_send
+            .drain(..)
+            .try_for_each(|(message_bytes, channel_kind)| {
+                self.message_manager
+                    .buffer_send(message_bytes, channel_kind)?;
+                Ok::<(), ClientError>(())
+            })?;
+
+        // get the payloads from the message manager
         let payloads = self.message_manager.send_packets(tick_manager.tick());
 
         // update the replication sender about which messages were actually sent, and accumulate priority
@@ -350,7 +386,6 @@ impl ConnectionManager {
         tick_manager: &TickManager,
     ) -> Result<(), ClientError> {
         let _span = trace_span!("receive").entered();
-        let message_registry = world.resource::<MessageRegistry>();
         self.message_manager
             .channels
             .iter_mut()
@@ -398,10 +433,11 @@ impl ConnectionManager {
                         let updates = EntityUpdatesMessage::from_bytes(&mut reader)?;
                         self.replication_receiver.recv_updates(updates, tick);
                     } else {
+                        // TODO: this code is copy-pasted from self.receive_message because of borrow checker limitations
                         // identify the type of message
                         let net_id = NetId::from_bytes(&mut reader)?;
                         let single_data = reader.consume();
-                        match message_registry.message_type(net_id) {
+                        match self.message_registry.message_type(net_id) {
                             #[cfg(feature = "leafwing")]
                             MessageType::LeafwingInput => {
                                 self.received_leafwing_input_messages
@@ -435,6 +471,32 @@ impl ConnectionManager {
                     &mut self.events,
                 );
             });
+        }
+        Ok(())
+    }
+
+    /// Receive a message from the server
+    pub(crate) fn receive_message(&mut self, mut reader: Reader) -> Result<(), SerializationError> {
+        // identify the type of message
+        let net_id = NetId::from_bytes(&mut reader)?;
+        let single_data = reader.consume();
+        match self.message_registry.message_type(net_id) {
+            #[cfg(feature = "leafwing")]
+            MessageType::LeafwingInput => {
+                self.received_leafwing_input_messages
+                    .entry(net_id)
+                    .or_default()
+                    .push(single_data);
+            }
+            MessageType::NativeInput => {
+                todo!()
+            }
+            MessageType::Normal => {
+                self.received_messages
+                    .entry(net_id)
+                    .or_default()
+                    .push(single_data);
+            }
         }
         Ok(())
     }
@@ -511,7 +573,6 @@ impl ReplicationReceive for ConnectionManager {
 
 impl ReplicationSend for ConnectionManager {
     type Error = ClientError;
-    type ReplicateCache = EntityHashMap<ReplicateCache>;
 
     fn writer(&mut self) -> &mut Writer {
         &mut self.writer
@@ -525,5 +586,59 @@ impl ReplicationSend for ConnectionManager {
         debug!("Running replication clean");
         self.replication_sender.cleanup(tick);
         self.delta_manager.tick_cleanup(tick);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::prelude::{client, server, ClientConnectionManager};
+    use crate::tests::protocol::Message2;
+    use crate::tests::stepper::{BevyStepper, Step};
+
+    /// Check that we can map entities from the local world to the remote world
+    /// using the ConnectionManager
+    #[test]
+    fn test_map_entities_to_remote() {
+        let mut stepper = BevyStepper::default();
+
+        // spawn an entity on server
+        let server_entity = stepper
+            .server_app
+            .world_mut()
+            .spawn(server::Replicate::default())
+            .id();
+        stepper.frame_step();
+        stepper.frame_step();
+
+        // check that the entity was spawned
+        let client_entity = *stepper
+            .client_app
+            .world()
+            .resource::<client::ConnectionManager>()
+            .replication_receiver
+            .remote_entity_map
+            .get_local(server_entity)
+            .expect("entity was not replicated to client");
+
+        // spawn an entity on the client which contains a link to another entity
+        // we need to map that entity to the remote world
+        assert_eq!(
+            *stepper
+                .client_app
+                .world_mut()
+                .resource_mut::<ClientConnectionManager>()
+                .local_to_remote_map()
+                .get(&client_entity)
+                .unwrap(),
+            server_entity
+        );
+
+        let mut message = Message2(client_entity);
+        stepper
+            .client_app
+            .world_mut()
+            .resource_mut::<ClientConnectionManager>()
+            .map_entities_to_remote(&mut message);
+        assert_eq!(message.0, server_entity);
     }
 }

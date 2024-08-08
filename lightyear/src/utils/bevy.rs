@@ -1,6 +1,6 @@
 //! Implement lightyear traits for some common bevy types
 
-use bevy::prelude::Transform;
+use bevy::prelude::{Quat, Transform};
 use tracing::trace;
 
 use crate::client::components::LerpFn;
@@ -25,5 +25,15 @@ impl LerpFn<Transform> for TransformLinearInterpolation {
             res
         );
         res
+    }
+}
+
+
+/// Perform a spherical linear interpolation between two quaternions
+pub struct QuatSphericalLinearInterpolation;
+
+impl LerpFn<Quat> for QuatSphericalLinearInterpolation {
+    fn lerp(start: &Quat, other: &Quat, t: f32) -> Quat {
+        start.slerp(*other, t)
     }
 }

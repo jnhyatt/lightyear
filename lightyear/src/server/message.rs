@@ -1,16 +1,15 @@
 use std::ops::DerefMut;
 
-use bevy::app::{App, PreUpdate};
-use bevy::prelude::{EventWriter, IntoSystemConfigs, Res, ResMut};
-use tracing::{error, trace};
-
-use crate::prelude::{is_started, Message};
+use crate::prelude::{server::is_started, Message};
 use crate::protocol::message::{MessageKind, MessageRegistry};
 use crate::serialize::reader::Reader;
 use crate::server::connection::ConnectionManager;
 use crate::server::events::MessageEvent;
 use crate::shared::replication::network_target::NetworkTarget;
 use crate::shared::sets::{InternalMainSet, ServerMarker};
+use bevy::app::{App, PreUpdate};
+use bevy::prelude::{EventWriter, IntoSystemConfigs, Res, ResMut};
+use tracing::{error, trace};
 
 /// Read the messages received from the clients and emit the MessageEvent event
 fn read_message<M: Message>(
@@ -64,8 +63,8 @@ fn read_message<M: Message>(
     }
 }
 
-/// Register a message that can be sent from server to client
-pub(crate) fn add_client_to_server_message<M: Message>(app: &mut App) {
+/// Register a message that can be sent from client to server
+pub(crate) fn add_server_receive_message_from_client<M: Message>(app: &mut App) {
     app.add_event::<MessageEvent<M>>();
     app.add_systems(
         PreUpdate,
@@ -178,3 +177,56 @@ pub(crate) fn add_client_to_server_message<M: Message>(app: &mut App) {
 
 // TODO: another option is to add ClientMessage and ServerMessage to ProtocolMessage
 // then we can keep the shared logic in connection.mod. We just lose 1 bit everytime...
+
+#[cfg(test)]
+mod tests {
+    use crate::prelude::ClientId;
+    use crate::tests::host_server_stepper::{HostServerStepper, Step, LOCAL_CLIENT_ID};
+    use crate::tests::protocol::{Channel1, Message1};
+    use bevy::app::Update;
+    use bevy::prelude::{EventReader, ResMut, Resource};
+
+    #[derive(Resource, Default)]
+    struct Counter(usize);
+
+    /// System to check that we received the message on the server
+    fn count_messages(
+        mut counter: ResMut<Counter>,
+        mut events: EventReader<crate::client::events::MessageEvent<Message1>>,
+    ) {
+        for event in events.read() {
+            assert_eq!(event.message().0, "a".to_string());
+            counter.0 += 1;
+        }
+    }
+
+    /// In host-server mode, the server is sending a message to the local client
+    #[test]
+    fn server_send_message_to_local_client() {
+        tracing_subscriber::FmtSubscriber::builder()
+            .with_max_level(tracing::Level::ERROR)
+            .init();
+        let mut stepper = HostServerStepper::default();
+
+        stepper.server_app.init_resource::<Counter>();
+        stepper.server_app.add_systems(Update, count_messages);
+
+        // send a message from the local client to the server
+        stepper
+            .server_app
+            .world_mut()
+            .resource_mut::<crate::prelude::server::ConnectionManager>()
+            .send_message::<Channel1, Message1>(
+                ClientId::Local(LOCAL_CLIENT_ID),
+                &Message1("a".to_string()),
+            )
+            .unwrap();
+        stepper.frame_step();
+        stepper.frame_step();
+        stepper.frame_step();
+        stepper.frame_step();
+
+        // verify that the server received the message
+        assert_eq!(stepper.server_app.world().resource::<Counter>().0, 1);
+    }
+}

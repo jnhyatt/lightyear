@@ -24,9 +24,10 @@ mod easings;
 
 pub(crate) mod io;
 pub(crate) mod message;
-pub(crate) mod networking;
+pub mod networking;
 pub mod replication;
 
 pub mod error;
+pub mod run_conditions;
 #[cfg(target_family = "wasm")]
 pub mod web;

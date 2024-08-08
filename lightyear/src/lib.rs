@@ -22,14 +22,14 @@ fn run_client_app() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(ClientPlugins::new(ClientConfig::default()))
-        .run()
+        .run();
 }
 
 fn run_server_app() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(ServerPlugins::new(ServerConfig::default()))
-        .run()
+        .run();
 }
 ```
 In general, you will have to modify some parts of the [`ClientConfig`](prelude::client::ClientConfig) and [`ServerConfig`](prelude::server::ServerConfig) to fit your game.
@@ -163,6 +163,7 @@ fn component_inserted(query: Query<Entity, (With<Replicated>, Added<MyComponent>
 [`Replicating`]: prelude::Replicating
 [`SharedConfig`]: prelude::SharedConfig
  */
+#![allow(clippy::missing_transmute_annotations)]
 #![allow(unused_variables)]
 #![allow(clippy::too_many_arguments)]
 #![allow(dead_code)]
@@ -214,6 +215,7 @@ pub mod prelude {
     pub use crate::shared::replication::hierarchy::ParentSync;
     pub use crate::shared::replication::network_target::NetworkTarget;
     pub use crate::shared::replication::plugin::ReplicationConfig;
+    pub use crate::shared::replication::plugin::SendUpdatesMode;
     pub use crate::shared::replication::resources::{
         ReplicateResourceExt, ReplicateResourceMetadata, StopReplicateResourceExt,
     };
@@ -224,6 +226,31 @@ pub mod prelude {
     pub use crate::shared::time_manager::TimeManager;
     pub use crate::transport::middleware::compression::CompressionConfig;
     pub use crate::transport::middleware::conditioner::LinkConditionerConfig;
+
+    mod rename {
+        pub use crate::client::events::ComponentInsertEvent as ClientComponentInsertEvent;
+        pub use crate::client::events::ComponentRemoveEvent as ClientComponentRemoveEvent;
+        pub use crate::client::events::ComponentUpdateEvent as ClientComponentUpdateEvent;
+        pub use crate::client::events::ConnectEvent as ClientConnectEvent;
+        pub use crate::client::events::DisconnectEvent as ClientDisconnectEvent;
+        pub use crate::client::events::EntityDespawnEvent as ClientEntityDespawnEvent;
+        pub use crate::client::events::EntitySpawnEvent as ClientEntitySpawnEvent;
+        pub use crate::client::events::MessageEvent as ClientMessageEvent;
+
+        pub use crate::client::connection::ConnectionManager as ClientConnectionManager;
+
+        pub use crate::server::events::ComponentInsertEvent as ServerComponentInsertEvent;
+        pub use crate::server::events::ComponentRemoveEvent as ServerComponentRemoveEvent;
+        pub use crate::server::events::ComponentUpdateEvent as ServerComponentUpdateEvent;
+        pub use crate::server::events::ConnectEvent as ServerConnectEvent;
+        pub use crate::server::events::DisconnectEvent as ServerDisconnectEvent;
+        pub use crate::server::events::EntityDespawnEvent as ServerEntityDespawnEvent;
+        pub use crate::server::events::EntitySpawnEvent as ServerEntitySpawnEvent;
+        pub use crate::server::events::MessageEvent as ServerMessageEvent;
+
+        pub use crate::server::connection::ConnectionManager as ServerConnectionManager;
+    }
+    pub use rename::*;
 
     pub mod client {
         pub use crate::client::components::{
@@ -237,7 +264,7 @@ pub mod prelude {
             DisconnectEvent, EntityDespawnEvent, EntitySpawnEvent, InputEvent, MessageEvent,
         };
         #[cfg(feature = "leafwing")]
-        pub use crate::client::input::leafwing::{LeafwingInputConfig, ToggleActions};
+        pub use crate::client::input::leafwing::LeafwingInputConfig;
         pub use crate::client::input::native::{InputConfig, InputManager, InputSystemSet};
         pub use crate::client::interpolation::interpolation_history::ConfirmedHistory;
         pub use crate::client::interpolation::plugin::{
@@ -258,6 +285,7 @@ pub mod prelude {
         pub use crate::client::prediction::Predicted;
         pub use crate::client::replication::commands::DespawnReplicationCommandExt;
         pub use crate::client::replication::send::Replicate;
+        pub use crate::client::run_conditions::{is_connected, is_disconnected, is_synced};
         pub use crate::client::sync::SyncConfig;
         pub use crate::connection::client::{
             Authentication, ClientConnection, IoConfig, NetClient, NetConfig,
@@ -290,9 +318,10 @@ pub mod prelude {
         pub use crate::server::relevance::room::{RoomId, RoomManager};
         pub use crate::server::replication::commands::DespawnReplicationCommandExt;
         pub use crate::server::replication::{
-            send::{ControlledBy, Replicate, ServerFilter, SyncTarget},
+            send::{ControlledBy, Lifetime, Replicate, ServerFilter, SyncTarget},
             ReplicationSet, ServerReplicationSet,
         };
+        pub use crate::server::run_conditions::{is_started, is_stopped};
     }
 
     #[cfg(all(feature = "steam", not(target_family = "wasm")))]
