@@ -6,139 +6,115 @@
 //! - read inputs from the clients and move the player entities accordingly
 //!
 //! Lightyear will handle the replication of entities automatically if you add a `Replicate` component to them.
-use bevy::app::PluginGroupBuilder;
-use bevy::prelude::*;
-use bevy::utils::HashMap;
-use lightyear::prelude::server::*;
-use lightyear::prelude::*;
-use lightyear::shared::replication::components::ReplicationTarget;
-use std::sync::Arc;
-
+use crate::automation::AutomationServerPlugin;
 use crate::protocol::*;
 use crate::shared;
+use bevy::prelude::*;
+use lightyear::connection::client::Connected;
+use lightyear::connection::host::HostServer;
+use lightyear::prelude::input::native::*;
+use lightyear::prelude::server::*;
+use lightyear::prelude::*;
+use lightyear_examples_common::shared::SEND_INTERVAL;
 
 pub struct ExampleServerPlugin;
 
 impl Plugin for ExampleServerPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, (init, start_server));
-        // the physics/FixedUpdates systems that consume inputs should be run in this set
+        app.add_plugins(AutomationServerPlugin);
+        app.insert_resource(ReplicationMetadata::new(SEND_INTERVAL));
+        // the physics/FixedUpdates systems that consume inputs should be run in this set.
         app.add_systems(FixedUpdate, movement);
-        app.add_systems(Update, (send_message, handle_connections));
+        app.add_observer(handle_new_client);
+        app.add_observer(handle_connected);
+        app.add_systems(Update, send_message);
     }
 }
 
-/// Start the server
-fn start_server(mut commands: Commands) {
-    commands.start_server();
+/// When a new client tries to connect to a server, an entity is created for it with the `LinkOf` component.
+/// This entity represents the link between the server and that client.
+///
+/// You can add additional components to update the link. In this case we will add a `ReplicationSender` that
+/// will enable us to replicate local entities to that client.
+pub(crate) fn handle_new_client(trigger: On<Add, LinkOf>, mut commands: Commands) {
+    commands
+        .entity(trigger.entity)
+        .insert((ReplicationSender, Name::from("Client")));
 }
 
-/// Add some debugging text to the screen
-fn init(mut commands: Commands) {
-    commands.spawn(
-        TextBundle::from_section(
-            "Server",
-            TextStyle {
-                font_size: 30.0,
-                color: Color::WHITE,
-                ..default()
+/// If the new client connects to the server, we want to spawn a new player entity for it.
+///
+/// We have to react specifically on `Connected` because there is no guarantee that the connection request we
+/// received was valid. The server could reject the connection attempt for many reasons (server is full, packet is invalid,
+/// DDoS attempt, etc.). We want to start the replication only when the client is confirmed as connected.
+pub(crate) fn handle_connected(
+    trigger: On<Add, Connected>,
+    query: Query<&RemoteId, With<ClientOf>>,
+    mut commands: Commands,
+) {
+    let Ok(client_id) = query.get(trigger.entity) else {
+        return;
+    };
+    let client_id = client_id.0;
+    let entity = commands
+        .spawn((
+            PlayerBundle::new(client_id, Vec2::ZERO),
+            // we replicate the Player entity to all clients that are connected to this server
+            Replicate::to_clients(NetworkTarget::All),
+            PredictionTarget::to_clients(NetworkTarget::Single(client_id)),
+            InterpolationTarget::to_clients(NetworkTarget::AllExceptSingle(client_id)),
+            ControlledBy {
+                owner: trigger.entity,
+                lifetime: Default::default(),
             },
-        )
-        .with_style(Style {
-            align_self: AlignSelf::End,
-            ..default()
-        }),
+        ))
+        .id();
+    info!(
+        "Create player entity {:?} for client {:?}",
+        entity, client_id
     );
 }
 
-/// Server connection system, create a player upon connection
-pub(crate) fn handle_connections(
-    mut connections: EventReader<ConnectEvent>,
-    mut commands: Commands,
+/// Applies received client inputs on the server so other clients can observe the result.
+fn movement(
+    timeline: Res<LocalTimeline>,
+    host_server: Query<(), With<HostServer>>,
+    mut position_query: Query<(&mut PlayerPosition, &ActionState<Inputs>, Has<Predicted>)>,
 ) {
-    for connection in connections.read() {
-        let client_id = connection.client_id;
-        // server and client are running in the same app, no need to replicate to the local client
-        let replicate = Replicate {
-            sync: SyncTarget {
-                prediction: NetworkTarget::Single(client_id),
-                interpolation: NetworkTarget::AllExceptSingle(client_id),
-            },
-            controlled_by: ControlledBy {
-                target: NetworkTarget::Single(client_id),
-            },
-            ..default()
-        };
-        let entity = commands.spawn((PlayerBundle::new(client_id, Vec2::ZERO), replicate));
-        info!("Create entity {:?} for client {:?}", entity.id(), client_id);
-    }
-}
-
-/// Handle client disconnections: we want to despawn every entity that was controlled by that client.
-///
-/// Lightyear creates one entity per client, which contains metadata associated with that client.
-/// You can find that entity by calling `ConnectionManager::client_entity(client_id)`.
-///
-/// That client entity contains the `ControlledEntities` component, which is a set of entities that are controlled by that client.
-///
-/// By default, lightyear automatically despawns all the `ControlledEntities` when the client disconnects;
-/// but in this example we will also do it manually to showcase how it can be done.
-/// (however we don't actually run the system)
-pub(crate) fn handle_disconnections(
-    mut commands: Commands,
-    mut disconnections: EventReader<DisconnectEvent>,
-    manager: Res<ConnectionManager>,
-    client_query: Query<&ControlledEntities>,
-) {
-    for disconnection in disconnections.read() {
-        debug!("Client {:?} disconnected", disconnection.client_id);
-        if let Ok(client_entity) = manager.client_entity(disconnection.client_id) {
-            if let Ok(controlled_entities) = client_query.get(client_entity) {
-                for entity in controlled_entities.iter() {
-                    commands.entity(*entity).despawn();
-                }
-            }
+    let is_host_server = !host_server.is_empty();
+    let tick = timeline.tick();
+    for (position, inputs, predicted) in position_query.iter_mut() {
+        if is_host_server && predicted {
+            continue;
         }
-    }
-}
-
-/// Read client inputs and move players
-pub(crate) fn movement(
-    mut position_query: Query<(&ControlledBy, &mut PlayerPosition)>,
-    mut input_reader: EventReader<InputEvent<Inputs>>,
-    tick_manager: Res<TickManager>,
-) {
-    for input in input_reader.read() {
-        let client_id = input.context();
-        if let Some(input) = input.input() {
-            trace!(
-                "Receiving input: {:?} from client: {:?} on tick: {:?}",
-                input,
-                client_id,
-                tick_manager.tick()
-            );
-            // NOTE: you can define a mapping from client_id to entity_id to avoid iterating through all
-            //  entities here
-            for (controlled_by, position) in position_query.iter_mut() {
-                if controlled_by.targets(client_id) {
-                    shared::shared_movement_behaviour(position, input);
-                }
-            }
-        }
+        trace!(?tick, ?position, ?inputs, "server");
+        trace!(
+            target: "lightyear_debug::simple_box",
+            kind = "simple_box_server_input",
+            schedule = "FixedUpdate",
+            sample_point = "FixedUpdate",
+            local_tick = tick.0,
+            input = ?inputs.0,
+            position = ?position.0,
+            predicted,
+            "applied simple_box server input"
+        );
+        shared::shared_movement_behaviour(position, inputs);
     }
 }
 
 /// Send messages from server to clients (only in non-headless mode, because otherwise we run with minimal plugins
 /// and cannot do input handling)
 pub(crate) fn send_message(
-    mut server: ResMut<ConnectionManager>,
+    mut sender: ServerMultiMessageSender,
+    server: Single<&Endpoint>,
     input: Option<Res<ButtonInput<KeyCode>>>,
 ) {
-    if input.is_some_and(|input| input.pressed(KeyCode::KeyM)) {
+    if input.is_some_and(|input| input.just_pressed(KeyCode::KeyM)) {
         let message = Message1(5);
-        info!("Send message: {:?}", message);
-        server
-            .send_message_to_target::<Channel1, Message1>(&Message1(5), NetworkTarget::All)
+        info!("Sending message: {:?}", message);
+        sender
+            .send::<_, Channel1>(&message, server.into_inner(), &NetworkTarget::All)
             .unwrap_or_else(|e| {
                 error!("Failed to send message: {:?}", e);
             });

@@ -6,90 +6,81 @@
 //! - read inputs from the clients and move the player entities accordingly
 //!
 //! Lightyear will handle the replication of entities automatically if you add a `Replicate` component to them.
+extern crate alloc;
+use alloc::sync::Arc;
 use anyhow::Context;
 use async_compat::Compat;
-use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use core::net::SocketAddr;
+use std::sync::RwLock;
 
+use bevy::platform::collections::HashSet;
 use bevy::prelude::*;
 use bevy::tasks::IoTaskPool;
-use bevy::utils::{Duration, HashSet};
+use core::time::Duration;
+use lightyear::netcode::ConnectToken;
+use lightyear::prelude::server::*;
+use lightyear::prelude::*;
+use lightyear_examples_common::shared::{SEND_INTERVAL, SERVER_ADDR, SERVER_PORT, SHARED_SETTINGS};
 use tokio::io::AsyncWriteExt;
 
-use lightyear::prelude::server::*;
-use lightyear::prelude::ClientId::Netcode;
-use lightyear::prelude::*;
-
-use crate::protocol::*;
 use crate::shared;
 
 pub struct ExampleServerPlugin {
-    pub protocol_id: u64,
-    pub private_key: Key,
     pub game_server_addr: SocketAddr,
     pub auth_backend_addr: SocketAddr,
 }
 
 impl Plugin for ExampleServerPlugin {
     fn build(&self, app: &mut App) {
-        let client_ids = Arc::new(RwLock::new(HashSet::default()));
-        app.add_systems(Startup, (init, start_server));
+        app.insert_resource(ReplicationMetadata::new(SEND_INTERVAL));
+        app.add_observer(handle_disconnect_event);
+        app.add_observer(handle_connect_event);
 
+        let client_ids = Arc::new(RwLock::new(HashSet::default()));
         start_netcode_authentication_task(
             self.game_server_addr,
             self.auth_backend_addr,
-            self.protocol_id,
-            self.private_key,
             client_ids.clone(),
         );
-
         app.insert_resource(ClientIds(client_ids));
     }
 }
 
-/// Start the server
-fn start_server(mut commands: Commands) {
-    commands.start_server();
-}
-
-/// Add some debugging text to the screen
-fn init(mut commands: Commands) {
-    commands.spawn(
-        TextBundle::from_section(
-            "Server",
-            TextStyle {
-                font_size: 30.0,
-                color: Color::WHITE,
-                ..default()
-            },
-        )
-        .with_style(Style {
-            align_self: AlignSelf::End,
-            ..default()
-        }),
-    );
-}
-
 /// This resource will track the list of Netcode client-ids currently in use, so that
 /// we don't have multiple clients with the same id
-#[derive(Resource)]
+#[derive(Resource, Default)]
 struct ClientIds(Arc<RwLock<HashSet<u64>>>);
 
-/// Update the list of connected client ids when a client connects or disconnects
-fn handle_connect_events(
+/// Update the list of connected client ids when a client disconnects
+fn handle_disconnect_event(
+    trigger: On<Add, Disconnected>,
+    query: Query<&RemoteId, With<ClientOf>>,
     client_ids: Res<ClientIds>,
-    mut connect_events: EventReader<ConnectEvent>,
-    mut disconnect_events: EventReader<DisconnectEvent>,
 ) {
-    for event in connect_events.read() {
-        if let Netcode(client_id) = event.client_id {
-            client_ids.0.write().unwrap().insert(client_id);
-        }
+    let Ok(remote_id) = query.get(trigger.entity) else {
+        return;
+    };
+    if let PeerId::Netcode(client_id) = remote_id.0 {
+        info!(
+            "Client disconnected: {}. Removing from ClientIds.",
+            client_id
+        );
+        client_ids.0.write().unwrap().remove(&client_id);
     }
-    for event in disconnect_events.read() {
-        if let Netcode(client_id) = event.client_id {
-            client_ids.0.write().unwrap().remove(&client_id);
-        }
+}
+
+/// Update the list of connected client ids when a client connects
+fn handle_connect_event(
+    trigger: On<Add, Connected>,
+    query: Query<&RemoteId, With<ClientOf>>,
+    client_ids: Res<ClientIds>,
+) {
+    let Ok(remote_id) = query.get(trigger.entity) else {
+        return;
+    };
+    if let PeerId::Netcode(client_id) = remote_id.0 {
+        info!("Client connected: {}. Adding to ClientIds.", client_id);
+        client_ids.0.write().unwrap().insert(client_id);
     }
 }
 
@@ -97,8 +88,6 @@ fn handle_connect_events(
 fn start_netcode_authentication_task(
     game_server_addr: SocketAddr,
     auth_backend_addr: SocketAddr,
-    protocol_id: u64,
-    private_key: Key,
     client_ids: Arc<RwLock<HashSet<u64>>>,
 ) {
     IoTaskPool::get()
@@ -122,10 +111,14 @@ fn start_netcode_authentication_task(
                     }
                 };
 
-                let token =
-                    ConnectToken::build(game_server_addr, protocol_id, client_id, private_key)
-                        .generate()
-                        .expect("Failed to generate token");
+                let token = ConnectToken::build(
+                    game_server_addr,
+                    SHARED_SETTINGS.protocol_id,
+                    client_id,
+                    SHARED_SETTINGS.private_key,
+                )
+                .generate()
+                .expect("Failed to generate token");
 
                 let serialized_token = token.try_into_bytes().expect("Failed to serialize token");
                 trace!(

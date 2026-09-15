@@ -1,0 +1,63 @@
+[package]
+name = "lightyear_webtransport"
+version = "0.30.0"
+authors = ["aecsocket <aecsocket@tutanota.com>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "IO primitives for the lightyear networking library"
+repository = "https://github.com/cBournhonesque/lightyear"
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustflags = ["--cfg=web_sys_unstable_apis"]
+targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
+
+[features]
+default = ["self-signed"]
+client = ["aeronet_webtransport/client"]
+## Enables native accepting endpoints without selecting a Lightyear server role.
+p2p = ["aeronet_webtransport/server", "bevy_reflect/std"]
+server = ["aeronet_webtransport/server", "bevy_reflect/std"]
+
+## Enables `wtransport/self-signed`, allowing you to generate self-signed certificates easily for
+## use in a server.
+##
+## Note that, without explicitly allowing your server's self-signed certificate (or using
+## `dangerous-configuration` and disabling certificate validation), clients will not be able to
+## connect to a server with self-signed certificates.
+self-signed = ["aeronet_webtransport/self-signed"]
+
+## Enables `wtransport/dangerous-configuration`, allowing you to use potentially dangerous
+## certificate validation configurations.
+##
+## You should not use dangerous configurations in production builds of your app.
+dangerous-configuration = ["aeronet_webtransport/dangerous-configuration"]
+
+## Peer discovery over WebTransport: dials peers a `lightyear_p2p::Lobby` discovers, publishing this
+## endpoint's certificate hash so they can authenticate it, and annotates the sessions they open
+## towards us. Needs both halves of the transport, since one peer dials and the other accepts.
+lobby = ["client", "p2p", "dep:lightyear_p2p", "dep:lightyear_connection"]
+
+[dependencies]
+aeronet_webtransport.workspace = true
+aeronet_io.workspace = true
+lightyear_link.workspace = true
+lightyear_core.workspace = true
+lightyear_aeronet.workspace = true
+lightyear_p2p = { workspace = true, optional = true, features = ["std"] }
+lightyear_connection = { workspace = true, optional = true, features = [
+  "client",
+] }
+
+tracing.workspace = true
+
+# bevy
+bevy_app.workspace = true
+bevy_ecs.workspace = true
+bevy_reflect = { workspace = true, optional = true }
+
+thiserror.workspace = true

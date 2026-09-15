@@ -1,0 +1,281 @@
+use crate::SerializationError;
+use crate::varint::varint_parse_len;
+use alloc::vec::Vec;
+use bytes::{Buf, Bytes};
+use no_std_io2::io::{Cursor, Error, ErrorKind, Read, Result, Seek, SeekFrom};
+
+#[derive(Clone)]
+pub struct Reader(Cursor<Bytes>);
+
+#[inline(always)]
+fn saturating_sub_usize_u64(a: usize, b: u64) -> usize {
+    match usize::try_from(b) {
+        Ok(b) => a.saturating_sub(b),
+        Err(_) => 0,
+    }
+}
+
+impl From<Bytes> for Reader {
+    fn from(value: Bytes) -> Self {
+        // TODO: check that this has no cost
+        Self(Cursor::new(value))
+    }
+}
+
+impl From<Vec<u8>> for Reader {
+    fn from(value: Vec<u8>) -> Self {
+        Self(Cursor::new(value.into()))
+    }
+}
+
+impl Seek for Reader {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        self.0.seek(pos)
+    }
+}
+
+impl Read for Reader {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Buf for Reader {
+    fn remaining(&self) -> usize {
+        Reader::remaining(self)
+    }
+
+    fn chunk(&self) -> &[u8] {
+        let Ok(position) = usize::try_from(self.position()) else {
+            return &[];
+        };
+        self.as_ref().get(position..).unwrap_or_default()
+    }
+
+    fn advance(&mut self, cnt: usize) {
+        assert!(
+            cnt <= Reader::remaining(self),
+            "cannot advance past the remaining bytes"
+        );
+        self.0.set_position(self.position() + cnt as u64);
+    }
+}
+
+impl AsRef<[u8]> for Reader {
+    fn as_ref(&self) -> &[u8] {
+        self.0.get_ref().as_ref()
+    }
+}
+
+impl Reader {
+    /// Consumes the reader and returns its entire underlying buffer.
+    ///
+    /// This includes bytes before the current cursor position.
+    pub fn into_bytes(self) -> Bytes {
+        self.0.into_inner()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.get_ref().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Split of the next `len` bytes from the reader into a separate Bytes.
+    ///
+    /// This doesn't allocate and just increases some reference counts. O(1) cost.
+    /// Returns [`ErrorKind::UnexpectedEof`] if fewer than `len` bytes remain.
+    pub fn split_len(&mut self, len: usize) -> Result<Bytes> {
+        let current_pos = usize::try_from(self.0.position())
+            .map_err(|_| Error::from(ErrorKind::UnexpectedEof))?;
+        let new_pos = current_pos
+            .checked_add(len)
+            .filter(|&new_pos| new_pos <= self.len())
+            .ok_or_else(|| Error::from(ErrorKind::UnexpectedEof))?;
+        // slice off the subset into a separate Bytes
+        let bytes = self.0.get_ref().slice(current_pos..new_pos);
+        // increment the position
+        self.0.set_position(new_pos as u64);
+        Ok(bytes)
+    }
+
+    /// Return the remaining length of the buffer as a separate Bytes.
+    ///
+    /// This doesn't allocate and just increases some reference counts. O(1) cost.
+    pub fn take_remaining(&mut self) -> Bytes {
+        let current_pos = self.0.position() as usize;
+        self.0.get_mut().split_off(current_pos)
+    }
+
+    /// Returns the unread portion of the underlying buffer.
+    pub fn remaining_slice(&self) -> &[u8] {
+        let Ok(position) = usize::try_from(self.position()) else {
+            return &[];
+        };
+        self.as_ref().get(position..).unwrap_or_default()
+    }
+
+    pub fn has_remaining(&self) -> bool {
+        self.remaining() > 0
+    }
+
+    pub fn position(&self) -> u64 {
+        self.0.position()
+    }
+
+    pub fn set_position(&mut self, pos: u64) {
+        self.0.set_position(pos)
+    }
+
+    pub fn remaining(&self) -> usize {
+        saturating_sub_usize_u64(self.len(), self.position())
+    }
+}
+
+pub trait ReadInteger: Read {
+    #[inline]
+    fn read_u8(&mut self) -> Result<u8> {
+        let mut buf = [0; 1];
+        self.read_exact(&mut buf)?;
+        Ok(buf[0])
+    }
+
+    #[inline]
+    fn read_u16(&mut self) -> Result<u16> {
+        let mut buf = [0; 2];
+        self.read_exact(&mut buf)?;
+        Ok(u16::from_be_bytes(buf[..2].try_into().unwrap()))
+    }
+
+    #[inline]
+    fn read_u32(&mut self) -> Result<u32> {
+        let mut buf = [0; 4];
+        self.read_exact(&mut buf)?;
+        Ok(u32::from_be_bytes(buf[..4].try_into().unwrap()))
+    }
+
+    #[inline]
+    fn read_u64(&mut self) -> Result<u64> {
+        let mut buf = [0; 8];
+        self.read_exact(&mut buf)?;
+        Ok(u64::from_be_bytes(buf[..8].try_into().unwrap()))
+    }
+
+    #[inline]
+    fn read_i8(&mut self) -> Result<i8> {
+        let mut buf = [0; 1];
+        self.read_exact(&mut buf)?;
+        Ok(buf[0] as i8)
+    }
+
+    #[inline]
+    fn read_i16(&mut self) -> Result<i16> {
+        let mut buf = [0; 2];
+        self.read_exact(&mut buf)?;
+        Ok(i16::from_be_bytes(buf[..2].try_into().unwrap()))
+    }
+
+    #[inline]
+    fn read_i32(&mut self) -> Result<i32> {
+        let mut buf = [0; 4];
+        self.read_exact(&mut buf)?;
+        Ok(i32::from_be_bytes(buf[..4].try_into().unwrap()))
+    }
+
+    #[inline]
+    fn read_i64(&mut self) -> Result<i64> {
+        let mut buf = [0; 8];
+        self.read_exact(&mut buf)?;
+        Ok(i64::from_be_bytes(buf[..8].try_into().unwrap()))
+    }
+}
+
+pub trait ReadVarInt: ReadInteger {
+    /// Reads an unsigned variable-length integer in network byte-order from
+    /// the current offset and advances the buffer.
+    fn read_varint(&mut self) -> core::result::Result<u64, SerializationError> {
+        let first = self.read_u8()?;
+        let len = varint_parse_len(first);
+        let out = match len {
+            1 => u64::from(first),
+            2 => {
+                let mut bytes = [first, 0];
+                self.read_exact(&mut bytes[1..])?;
+                u64::from(u16::from_be_bytes(bytes) & 0x3fff)
+            }
+            4 => {
+                let mut bytes = [first, 0, 0, 0];
+                self.read_exact(&mut bytes[1..])?;
+                u64::from(u32::from_be_bytes(bytes) & 0x3fffffff)
+            }
+            8 => {
+                let mut bytes = [first, 0, 0, 0, 0, 0, 0, 0];
+                self.read_exact(&mut bytes[1..])?;
+                u64::from_be_bytes(bytes) & 0x3fffffffffffffff
+            }
+            _ => return Err(Error::other("value is too large for varint").into()),
+        };
+        Ok(out)
+    }
+}
+
+impl<T: Read> ReadInteger for T {}
+impl<T: Read> ReadVarInt for T {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::writer::WriteInteger;
+    use no_std_io2::io;
+
+    use alloc::vec;
+
+    #[test]
+    fn test_read_integer() {
+        let mut writer = vec![];
+        writer.write_u8(1).unwrap();
+        writer.write_u16(2).unwrap();
+        writer.write_u32(3).unwrap();
+        writer.write_u64(4).unwrap();
+        writer.write_i8(-1).unwrap();
+        writer.write_i16(-2).unwrap();
+        writer.write_i32(-3).unwrap();
+        writer.write_i64(-4).unwrap();
+
+        let mut reader = io::Cursor::new(writer);
+
+        assert_eq!(reader.read_u8().unwrap(), 1);
+        assert_eq!(reader.read_u16().unwrap(), 2);
+        assert_eq!(reader.read_u32().unwrap(), 3);
+        assert_eq!(reader.read_u64().unwrap(), 4);
+        assert_eq!(reader.read_i8().unwrap(), -1);
+        assert_eq!(reader.read_i16().unwrap(), -2);
+        assert_eq!(reader.read_i32().unwrap(), -3);
+        assert_eq!(reader.read_i64().unwrap(), -4);
+    }
+
+    #[test]
+    fn test_read_varint_without_seek() {
+        let values = [
+            0,
+            63,
+            64,
+            16_383,
+            16_384,
+            1_073_741_823,
+            1_073_741_824,
+            4_611_686_018_427_387_903,
+        ];
+        let mut writer = vec![];
+        for value in values {
+            writer.write_varint(value).unwrap();
+        }
+
+        let mut reader = writer.as_slice();
+        for value in values {
+            assert_eq!(reader.read_varint().unwrap(), value);
+        }
+    }
+}

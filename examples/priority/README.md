@@ -6,45 +6,32 @@ quota.
 
 To not starve lower priority entities, their priority is accumulated over time, so that they can eventually be sent.
 
-In this example, the center row has priority 1.0, and each row further away from the center has a priority of +1.0.
-(e.g. row 5 will get updated 5 times more frequently than row 1.0)
+In this example, the server assigns Replicon's `ReplicatePriority` to each prop: the center row is low
+priority, the next rows are medium priority, and the outer rows are high priority. Replication priority
+only affects component mutations, so initial spawns are still sent immediately.
 
 You can find more information in
 the [book](https://github.com/cBournhonesque/lightyear/blob/main/book/src/concepts/advanced_replication/bandwidth_management.md)
 
 https://github.com/cBournhonesque/lightyear/assets/8112632/0efcd974-b181-4910-9312-5307fbd45718
 
-## Running the example
+## Running an example
 
-There are different 'modes' of operation:
+- Run the server with a GUI: `cargo run -- --headless=false server`
+- Run client with id 1: `cargo run -- client -c 1`
 
-- as a dedicated server with `cargo run -- server`
-- as a listen server with `cargo run -- listen-server`. This will launch 2 independent bevy apps (client and server) in
-  separate threads.
-  They will communicate via channels (so with almost 0 latency)
-- as a listen server with `cargo run -- host-server`. This will launch a single bevy app, where the server will also act
-  as a client. Functionally, it is similar to the "listen-server" mode, but you have a single bevy `World` instead of
-  separate client and server `Worlds`s.
+[//]: # (- Run the client and server in two separate bevy Apps: `cargo run` or `cargo run separate`)
+- Run the server without a gui: `cargo run --no-default-features --features=server -- server`
+- Run the client and server in "HostClient" mode, where the client also acts as server (both are in the same App) : `cargo run -- host-client -c 0`
 
-Then you can launch clients with the commands:
-
-- `cargo run -- client -c 1` (`-c 1` overrides the client id, to use client id 1)
-- `cargo run -- client -c 2`
-
-You can modify the file `assets/settings.ron` to modify some networking settings.
+You can control the behaviour of the example by changing the list of features. By default, all features are enabled (client, server, gui).
+For example you can run the server in headless mode (without gui) by running `cargo run --no-default-features --features=server,webtransport,netcode`.
 
 ### Testing in wasm with webtransport
 
-NOTE: I am using [trunk](https://trunkrs.dev/) to build and serve the wasm example.
+NOTE: I am using the [bevy cli](https://github.com/TheBevyFlock/bevy_cli) to build and serve the wasm example.
 
-To test the example in wasm, you can run the following commands: `trunk serve`
+To test the example in wasm, you can run the following commands: `bevy run web`
 
-You will need a valid SSL certificate to test the example in wasm using webtransport. You will need to run the following
-commands:
-
-- `sh examples/generate.sh` (to generate the temporary SSL certificates, they are only valid for 2 weeks)
-- `cargo run -- server` to start the server. The server will print out the certificate digest (something
-  like `1fd28860bd2010067cee636a64bcbb492142295b297fd8c480e604b70ce4d644`)
-- You then have to replace the certificate digest in the `assets/settings.ron` file with the one that the server printed
-  out.
-- then start the client wasm test with `trunk serve`
+The repo includes a pre-generated self-signed WebTransport certificate and digest, so you do not need to run the certificate generator for the usual local workflow while that certificate is valid. If it expires, or if you want to replace it, generate a new temporary self-signed certificate with:
+- `cargo run -p generate_certificate` (writes `certificates/cert.pem`, `certificates/key.pem`, and `certificates/digest.txt`; rebuild wasm clients after regenerating so they embed the new digest)

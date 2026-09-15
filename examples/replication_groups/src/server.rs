@@ -1,94 +1,100 @@
+extern crate alloc;
+use crate::automation::AutomationServerPlugin;
+use crate::protocol::*;
+use crate::shared::{shared_movement_behaviour, shared_tail_behaviour};
+use alloc::collections::VecDeque;
 use bevy::prelude::*;
-use bevy::utils::Duration;
-use bevy::utils::HashMap;
-
+use lightyear::connection::host::HostServer;
+use lightyear::input::native::prelude::ActionState;
+use lightyear::prediction::Predicted;
 use lightyear::prelude::server::*;
 use lightyear::prelude::*;
-
-use crate::protocol::*;
-use crate::shared;
-use crate::shared::{shared_movement_behaviour, shared_tail_behaviour};
+use lightyear_examples_common::shared::SEND_INTERVAL;
 
 // Plugin for server-specific logic
 pub struct ExampleServerPlugin;
 
 impl Plugin for ExampleServerPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, init);
+        app.add_plugins(AutomationServerPlugin);
+        app.insert_resource(ReplicationMetadata::new(SEND_INTERVAL));
         // the simulation systems that can be rolled back must run in FixedUpdate
         app.add_systems(FixedUpdate, (movement, shared_tail_behaviour).chain());
-        app.add_systems(Update, handle_connections);
+        app.add_observer(handle_new_client);
+        app.add_observer(handle_connections);
     }
 }
 
-/// Start the server
-pub(crate) fn init(mut commands: Commands) {
-    commands.start_server();
-    commands.spawn(
-        TextBundle::from_section(
-            "Server",
-            TextStyle {
-                font_size: 30.0,
-                color: Color::WHITE,
-                ..default()
-            },
-        )
-        .with_style(Style {
-            align_self: AlignSelf::End,
-            ..default()
-        }),
-    );
+pub(crate) fn handle_new_client(trigger: On<Add, LinkOf>, mut commands: Commands) {
+    commands
+        .entity(trigger.entity)
+        .insert((ReplicationSender, Name::from("Client")));
 }
 
 /// Server connection system, create a player upon connection
 pub(crate) fn handle_connections(
-    mut connections: EventReader<ConnectEvent>,
+    trigger: On<Add, Connected>,
+    query: Query<&RemoteId, With<ClientOf>>,
     mut commands: Commands,
 ) {
-    for connection in connections.read() {
-        let client_id = connection.client_id;
-        // Generate pseudo random color from client id.
-        let h = (((client_id.to_bits().wrapping_mul(30)) % 360) as f32) / 360.0;
-        let s = 0.8;
-        let l = 0.5;
-        let player_position = Vec2::ZERO;
-        let player_entity = commands
-            .spawn(PlayerBundle::new(client_id, player_position))
-            .id();
-        let tail_length = 300.0;
-        let tail_entity = commands
-            .spawn(TailBundle::new(
-                client_id,
-                player_entity,
-                player_position,
-                tail_length,
-            ))
-            .id();
-    }
+    let Ok(client_id) = query.get(trigger.entity) else {
+        return;
+    };
+    let client_id = client_id.0;
+    // Generate pseudo random color from client id.
+    let h = (((client_id.to_bits().wrapping_mul(30)) % 360) as f32) / 360.0;
+    let s = 0.8;
+    let l = 0.5;
+    let color = Color::hsl(h, s, l);
+    let player_position = Vec2::ZERO;
+    let player_entity = commands
+        .spawn((
+            PlayerId(client_id),
+            PlayerPosition(player_position),
+            PlayerColor(color),
+            Replicate::to_clients(NetworkTarget::All),
+            PredictionTarget::to_clients(NetworkTarget::Single(client_id)),
+            InterpolationTarget::to_clients(NetworkTarget::AllExceptSingle(client_id)),
+            ControlledBy {
+                owner: trigger.entity,
+                lifetime: Default::default(),
+            },
+            Name::from("Head"),
+        ))
+        .id();
+
+    let tail_length = 300.0;
+    let default_direction = Direction::Up;
+    let tail = default_direction.get_tail(player_position, tail_length);
+    let mut points = VecDeque::new();
+    points.push_front((tail, default_direction));
+    let tail_entity = commands
+        .spawn((
+            PlayerParent(player_entity),
+            TailPoints(points),
+            TailLength(tail_length),
+            ReplicateLike {
+                root: player_entity,
+            },
+            Name::from("Tail"),
+        ))
+        .id();
+    info!(
+        "New connection from client {client_id:?}, spawning player {player_entity:?} and tail {tail_entity:?}"
+    );
 }
 
 /// Read client inputs and move players
 pub(crate) fn movement(
-    mut position_query: Query<(&ControlledBy, &mut PlayerPosition)>,
-    mut input_reader: EventReader<InputEvent<Inputs>>,
-    tick_manager: Res<TickManager>,
+    host_server: Query<(), With<HostServer>>,
+    mut position_query: Query<(&mut PlayerPosition, &ActionState<Inputs>, Has<Predicted>)>,
 ) {
-    for input in input_reader.read() {
-        let client_id = input.context();
-        if let Some(input) = input.input() {
-            debug!(
-                "Receiving input: {:?} from client: {:?} on tick: {:?}",
-                input,
-                client_id,
-                tick_manager.tick()
-            );
-            // NOTE: you can define a mapping from client_id to entity_id to avoid iterating through all
-            //  entities here
-            for (controlled_by, position) in position_query.iter_mut() {
-                if controlled_by.targets(client_id) {
-                    shared::shared_movement_behaviour(position, input);
-                }
-            }
+    let is_host_server = !host_server.is_empty();
+    for (position, inputs, predicted) in position_query.iter_mut() {
+        if is_host_server && predicted {
+            continue;
         }
+        // Pass Mut<PlayerPosition> directly so change detection only fires when movement changes it.
+        shared_movement_behaviour(position, inputs);
     }
 }

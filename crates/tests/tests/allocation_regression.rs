@@ -1,0 +1,675 @@
+use std::alloc::System;
+use std::sync::Mutex;
+
+use bevy::ecs::schedule::{Schedules, SingleThreadedExecutor};
+use bevy::prelude::{Entity, FixedUpdate, Query, Res, ResMut, Resource, Update, With};
+use bevy_replicon::shared::server_entity_map::ServerEntityMap;
+use lightyear::prelude::{
+    MessageReceiver, MessageSender, NetworkTarget, Predicted, PredictionTarget, Replicate,
+    Transport,
+};
+use lightyear_prediction::predicted_history::PredictionHistory;
+use lightyear_tests::protocol::{Channel1, CompFull, StringMessage};
+use lightyear_tests::stepper::{
+    ClientServerStepper, ClientType, IoType, ServerType, StepperConfig,
+};
+use lightyear_udp::UdpIo;
+use lightyear_udp::endpoint::UdpEndpoint;
+use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
+
+#[global_allocator]
+static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
+static ALLOCATION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+const WARMUP_FRAMES: usize = 128;
+const MEASURED_FRAMES: usize = 32;
+
+#[derive(Resource, Default)]
+struct ReceivedMessageCount(usize);
+
+#[derive(Resource)]
+struct SimulationEnabled(bool);
+
+#[derive(Debug)]
+struct AllocationMeasurement {
+    idle: Stats,
+    active: Stats,
+    idle_frames: FrameSamples,
+    active_frames: FrameSamples,
+}
+
+#[derive(Debug)]
+struct AllocationBudget {
+    max_allocations_per_frame: usize,
+    max_bytes_per_frame: usize,
+}
+
+/// Per-frame allocation totals, sampled one frame at a time.
+///
+/// A measured window is short and the pipeline's own per-frame work is small
+/// next to the whole schedule's, so a single one-off allocation — a buffer
+/// growth, a deferred cleanup — landing in one window and not the other swamps
+/// the window totals. Sampling each frame and summarising with a median keeps
+/// the comparison on the frames the pipeline actually costs. The totals still
+/// back the leak checks, which look for retained memory rather than per-frame
+/// work.
+///
+/// The median is deliberately insensitive to a minority of frames: an
+/// allocation is only visible here once it is paid on at least half of them.
+/// That is the trade for tolerating isolated one-off events, which are what the
+/// short windows produce in CI — a 64 KB allocation on one frame in 32 is
+/// tolerated, while a 4 KB allocation on every frame fails. Catching work paid
+/// on fewer frames than that needs a per-frame count of the pipeline's own
+/// allocations, not a global one.
+#[derive(Default)]
+struct FrameSamples {
+    allocations: Vec<usize>,
+    bytes_allocated: Vec<usize>,
+}
+
+impl FrameSamples {
+    /// Samples for `count` frames.
+    ///
+    /// The buffers are sized up front, and created before the measured window
+    /// opens, so recording never allocates. A `push` inside the window would be
+    /// counted as the window's own work, and its retained capacity would trip the
+    /// leak check.
+    fn with_capacity(count: usize) -> Self {
+        Self {
+            allocations: Vec::with_capacity(count),
+            bytes_allocated: Vec::with_capacity(count),
+        }
+    }
+
+    /// Runs one frame, recording what it allocated.
+    fn record(&mut self, frame: impl FnOnce()) {
+        let before = GLOBAL.stats();
+        frame();
+        let after = GLOBAL.stats();
+        self.allocations
+            .push(after.allocations - before.allocations);
+        self.bytes_allocated
+            .push(after.bytes_allocated - before.bytes_allocated);
+    }
+
+    fn median_allocations(&self) -> usize {
+        median(&self.allocations)
+    }
+
+    fn median_bytes_allocated(&self) -> usize {
+        median(&self.bytes_allocated)
+    }
+}
+
+impl core::fmt::Debug for FrameSamples {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FrameSamples")
+            .field("median_allocations", &self.median_allocations())
+            .field("median_bytes_allocated", &self.median_bytes_allocated())
+            .field(
+                "max_bytes_allocated",
+                &self.bytes_allocated.iter().copied().max().unwrap_or(0),
+            )
+            .finish()
+    }
+}
+
+/// Upper median, so the value is always one of the samples.
+fn median(values: &[usize]) -> usize {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
+}
+
+#[test]
+fn steady_state_networking_work_stays_within_allocation_budget() {
+    let _guard = ALLOCATION_TEST_LOCK.lock().unwrap();
+    let message_stats = measure_message_send_receive();
+    let replication_stats = measure_replication_updates();
+    let prediction_stats = measure_prediction_updates();
+
+    eprintln!("message send/receive steady-state allocations: {message_stats:#?}");
+    eprintln!("replication update steady-state allocations: {replication_stats:#?}");
+    eprintln!("prediction update steady-state allocations: {prediction_stats:#?}");
+
+    // These are deliberately coarse per-frame ceilings. They detect meaningful
+    // regressions without depending on allocator layouts or upstream struct sizes.
+    assert_allocation_budget(
+        "message send/receive",
+        message_stats,
+        AllocationBudget {
+            max_allocations_per_frame: 16,
+            max_bytes_per_frame: 2 * 1024,
+        },
+    );
+    let entity_update_budget = || AllocationBudget {
+        max_allocations_per_frame: 2,
+        max_bytes_per_frame: 1024,
+    };
+    assert_allocation_budget(
+        "replication update",
+        replication_stats,
+        entity_update_budget(),
+    );
+    assert_allocation_budget(
+        "prediction update",
+        prediction_stats,
+        entity_update_budget(),
+    );
+}
+
+#[test]
+fn packet_payload_pool_has_no_misses_after_warmup_through_crossbeam_io() {
+    let _guard = ALLOCATION_TEST_LOCK.lock().unwrap();
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::from_connection_types(
+        vec![ClientType::Raw],
+        ServerType::Raw,
+    ));
+    stepper.server_app.init_resource::<ReceivedMessageCount>();
+    stepper
+        .server_app
+        .add_systems(Update, count_received_messages);
+    stepper.client_app().init_resource::<ReceivedMessageCount>();
+    stepper
+        .client_app()
+        .add_systems(Update, count_received_messages);
+    use_single_threaded_schedules(&mut stepper);
+
+    for _ in 0..WARMUP_FRAMES {
+        run_bidirectional_message_cycle(&mut stepper);
+    }
+    let misses_before = packet_payload_pool_misses(&stepper);
+    assert!(
+        misses_before > 0,
+        "warmup should exercise packet payload allocation instrumentation",
+    );
+
+    for _ in 0..MEASURED_FRAMES {
+        run_bidirectional_message_cycle(&mut stepper);
+    }
+
+    assert_eq!(
+        packet_payload_pool_misses(&stepper),
+        misses_before,
+        "the real Transport -> Link -> Crossbeam IO path allocated a packet payload after warmup",
+    );
+}
+
+#[test]
+fn udp_receive_payload_pool_has_no_misses_after_warmup() {
+    let _guard = ALLOCATION_TEST_LOCK.lock().unwrap();
+    let mut stepper =
+        ClientServerStepper::from_config(StepperConfig::single().with_io(IoType::Udp));
+    stepper.server_app.init_resource::<ReceivedMessageCount>();
+    stepper
+        .server_app
+        .add_systems(Update, count_received_messages);
+    stepper.client_app().init_resource::<ReceivedMessageCount>();
+    stepper
+        .client_app()
+        .add_systems(Update, count_received_messages);
+    use_single_threaded_schedules(&mut stepper);
+
+    for _ in 0..WARMUP_FRAMES {
+        run_bidirectional_message_cycle(&mut stepper);
+    }
+    let misses_before = udp_receive_pool_misses(&stepper);
+    assert!(
+        misses_before > 0,
+        "warmup should exercise UDP receive-buffer allocation instrumentation",
+    );
+
+    for _ in 0..MEASURED_FRAMES {
+        run_bidirectional_message_cycle(&mut stepper);
+    }
+
+    assert_eq!(
+        udp_receive_pool_misses(&stepper),
+        misses_before,
+        "the real Transport -> Netcode -> Link -> UDP path allocated a receive buffer after warmup",
+    );
+}
+
+fn udp_receive_pool_misses(stepper: &ClientServerStepper) -> usize {
+    stepper
+        .client(0)
+        .get::<UdpIo>()
+        .expect("UDP client should have UdpIo")
+        .recv_buffer_pool_misses()
+        + stepper
+            .server()
+            .get::<UdpEndpoint>()
+            .expect("UDP endpoint should exist")
+            .recv_buffer_pool_misses()
+}
+
+fn packet_payload_pool_misses(stepper: &ClientServerStepper) -> usize {
+    let client_misses = stepper
+        .client(0)
+        .get::<Transport>()
+        .expect("client should have a Transport")
+        .packet_payload_pool_misses();
+    let server_misses = stepper
+        .client_of(0)
+        .get::<Transport>()
+        .expect("server-side client should have a Transport")
+        .packet_payload_pool_misses();
+    client_misses + server_misses
+}
+
+fn measure_message_send_receive() -> AllocationMeasurement {
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::single());
+    stepper.server_app.init_resource::<ReceivedMessageCount>();
+    stepper
+        .server_app
+        .add_systems(Update, count_received_messages);
+    stepper.client_app().init_resource::<ReceivedMessageCount>();
+    stepper
+        .client_app()
+        .add_systems(Update, count_received_messages);
+    use_single_threaded_schedules(&mut stepper);
+
+    for _ in 0..WARMUP_FRAMES {
+        run_bidirectional_message_cycle(&mut stepper);
+    }
+
+    for _ in 0..WARMUP_FRAMES {
+        run_idle_message_cycle(&mut stepper);
+    }
+    let mut idle_frames = FrameSamples::with_capacity(MEASURED_FRAMES);
+    let region = Region::new(GLOBAL);
+    for _ in 0..MEASURED_FRAMES {
+        idle_frames.record(|| run_idle_message_cycle(&mut stepper));
+    }
+    let idle = region.change();
+
+    for _ in 0..WARMUP_FRAMES {
+        run_bidirectional_message_cycle(&mut stepper);
+    }
+    let mut active_frames = FrameSamples::with_capacity(MEASURED_FRAMES);
+    let region = Region::new(GLOBAL);
+    for _ in 0..MEASURED_FRAMES {
+        active_frames.record(|| run_bidirectional_message_cycle(&mut stepper));
+    }
+    AllocationMeasurement {
+        idle,
+        active: region.change(),
+        idle_frames,
+        active_frames,
+    }
+}
+
+fn run_idle_message_cycle(stepper: &mut ClientServerStepper) {
+    stepper.frame_step_server_first(1);
+    stepper.frame_step(1);
+}
+
+fn run_bidirectional_message_cycle(stepper: &mut ClientServerStepper) {
+    let client_received_before = stepper
+        .client_app()
+        .world()
+        .resource::<ReceivedMessageCount>()
+        .0;
+    stepper
+        .client_of_mut(0)
+        .get_mut::<MessageSender<StringMessage>>()
+        .expect("server-side message sender should exist")
+        .send::<Channel1>(StringMessage(String::new()));
+    for _ in 0..100 {
+        stepper.frame_step_server_first(1);
+        if stepper
+            .client_app()
+            .world()
+            .resource::<ReceivedMessageCount>()
+            .0
+            == client_received_before + 1
+        {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        stepper
+            .client_app()
+            .world()
+            .resource::<ReceivedMessageCount>()
+            .0,
+        client_received_before + 1,
+    );
+
+    let server_received_before = stepper
+        .server_app
+        .world()
+        .resource::<ReceivedMessageCount>()
+        .0;
+    stepper
+        .client_mut(0)
+        .get_mut::<MessageSender<StringMessage>>()
+        .expect("client-side message sender should exist")
+        .send::<Channel1>(StringMessage(String::new()));
+    for _ in 0..100 {
+        stepper.frame_step(1);
+        if stepper
+            .server_app
+            .world()
+            .resource::<ReceivedMessageCount>()
+            .0
+            == server_received_before + 1
+        {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        stepper
+            .server_app
+            .world()
+            .resource::<ReceivedMessageCount>()
+            .0,
+        server_received_before + 1,
+    );
+}
+
+fn count_received_messages(
+    mut receivers: Query<&mut MessageReceiver<StringMessage>>,
+    mut count: ResMut<ReceivedMessageCount>,
+) {
+    for mut receiver in &mut receivers {
+        count.0 += receiver.receive().count();
+    }
+}
+
+fn measure_replication_updates() -> AllocationMeasurement {
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::single());
+    use_single_threaded_schedules(&mut stepper);
+    let server_entity = stepper
+        .server_app
+        .world_mut()
+        .spawn((CompFull(0.0), Replicate::to_clients(NetworkTarget::All)))
+        .id();
+    let client_entity = wait_for_mapped_client_entity(&mut stepper, server_entity);
+
+    for _ in 0..WARMUP_FRAMES {
+        run_replication_update(&mut stepper, server_entity, client_entity);
+    }
+
+    for _ in 0..WARMUP_FRAMES {
+        stepper.frame_step_server_first(1);
+    }
+    let mut idle_frames = FrameSamples::with_capacity(MEASURED_FRAMES);
+    let region = Region::new(GLOBAL);
+    for _ in 0..MEASURED_FRAMES {
+        idle_frames.record(|| stepper.frame_step_server_first(1));
+    }
+    let idle = region.change();
+
+    for _ in 0..WARMUP_FRAMES {
+        run_replication_update(&mut stepper, server_entity, client_entity);
+    }
+    let mut active_frames = FrameSamples::with_capacity(MEASURED_FRAMES);
+    let region = Region::new(GLOBAL);
+    for _ in 0..MEASURED_FRAMES {
+        active_frames.record(|| run_replication_update(&mut stepper, server_entity, client_entity));
+    }
+    AllocationMeasurement {
+        idle,
+        active: region.change(),
+        idle_frames,
+        active_frames,
+    }
+}
+
+fn run_replication_update(
+    stepper: &mut ClientServerStepper,
+    server_entity: Entity,
+    client_entity: Entity,
+) {
+    let expected = {
+        let mut component = stepper
+            .server_app
+            .world_mut()
+            .get_mut::<CompFull>(server_entity)
+            .expect("server component should exist");
+        component.0 += 1.0;
+        component.0
+    };
+    stepper.frame_step_server_first(1);
+    assert_eq!(
+        stepper
+            .client_app()
+            .world()
+            .get::<CompFull>(client_entity)
+            .expect("replicated client component should exist")
+            .0,
+        expected,
+    );
+}
+
+fn measure_prediction_updates() -> AllocationMeasurement {
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::single());
+    stepper.server_app.insert_resource(SimulationEnabled(true));
+    stepper
+        .client_app()
+        .insert_resource(SimulationEnabled(true));
+    stepper
+        .server_app
+        .add_systems(FixedUpdate, increment_component);
+    stepper
+        .client_app()
+        .add_systems(FixedUpdate, increment_predicted_component);
+    use_single_threaded_schedules(&mut stepper);
+
+    let server_entity = stepper
+        .server_app
+        .world_mut()
+        .spawn((
+            CompFull(0.0),
+            Replicate::to_clients(NetworkTarget::All),
+            PredictionTarget::to_clients(NetworkTarget::All),
+        ))
+        .id();
+    let client_entity = wait_for_mapped_client_entity(&mut stepper, server_entity);
+    assert!(
+        stepper
+            .client_app()
+            .world()
+            .get::<Predicted>(client_entity)
+            .is_some(),
+        "client entity should be predicted",
+    );
+    assert!(
+        stepper
+            .client_app()
+            .world()
+            .get::<PredictionHistory<CompFull>>(client_entity)
+            .is_some(),
+        "predicted component should have a history buffer",
+    );
+
+    for _ in 0..WARMUP_FRAMES {
+        run_prediction_update(&mut stepper);
+    }
+
+    stepper
+        .server_app
+        .world_mut()
+        .resource_mut::<SimulationEnabled>()
+        .0 = false;
+    stepper
+        .client_app()
+        .world_mut()
+        .resource_mut::<SimulationEnabled>()
+        .0 = false;
+    for _ in 0..WARMUP_FRAMES {
+        run_prediction_update(&mut stepper);
+    }
+    let mut idle_frames = FrameSamples::with_capacity(MEASURED_FRAMES);
+    let region = Region::new(GLOBAL);
+    for _ in 0..MEASURED_FRAMES {
+        idle_frames.record(|| run_prediction_update(&mut stepper));
+    }
+    let idle = region.change();
+
+    stepper
+        .server_app
+        .world_mut()
+        .resource_mut::<SimulationEnabled>()
+        .0 = true;
+    stepper
+        .client_app()
+        .world_mut()
+        .resource_mut::<SimulationEnabled>()
+        .0 = true;
+    for _ in 0..WARMUP_FRAMES {
+        run_prediction_update(&mut stepper);
+    }
+    let mut active_frames = FrameSamples::with_capacity(MEASURED_FRAMES);
+    let region = Region::new(GLOBAL);
+    for _ in 0..MEASURED_FRAMES {
+        active_frames.record(|| run_prediction_update(&mut stepper));
+    }
+    let active = region.change();
+
+    let predicted = stepper
+        .client_app()
+        .world()
+        .get::<CompFull>(client_entity)
+        .expect("predicted client component should exist")
+        .0;
+    let authoritative = stepper
+        .server_app
+        .world()
+        .get::<CompFull>(server_entity)
+        .expect("authoritative server component should exist")
+        .0;
+    assert!(
+        predicted > authoritative,
+        "prediction should simulate ahead of the authoritative server",
+    );
+    assert!(
+        !stepper
+            .client_app()
+            .world()
+            .get::<PredictionHistory<CompFull>>(client_entity)
+            .expect("predicted component should retain its history buffer")
+            .is_empty(),
+        "prediction should record component history",
+    );
+    AllocationMeasurement {
+        idle,
+        active,
+        idle_frames,
+        active_frames,
+    }
+}
+
+fn increment_component(enabled: Res<SimulationEnabled>, mut components: Query<&mut CompFull>) {
+    if !enabled.0 {
+        return;
+    }
+    for mut component in &mut components {
+        component.0 += 1.0;
+    }
+}
+
+fn increment_predicted_component(
+    enabled: Res<SimulationEnabled>,
+    mut components: Query<&mut CompFull, With<Predicted>>,
+) {
+    if !enabled.0 {
+        return;
+    }
+    for mut component in &mut components {
+        component.0 += 1.0;
+    }
+}
+
+fn run_prediction_update(stepper: &mut ClientServerStepper) {
+    stepper.frame_step_server_first(1);
+}
+
+fn mapped_client_entity(stepper: &ClientServerStepper, server_entity: Entity) -> Entity {
+    stepper.client_apps[0]
+        .world()
+        .resource::<ServerEntityMap>()
+        .to_client()
+        .get(&server_entity)
+        .copied()
+        .expect("server entity should be mapped on the client")
+}
+
+fn wait_for_mapped_client_entity(
+    stepper: &mut ClientServerStepper,
+    server_entity: Entity,
+) -> Entity {
+    for _ in 0..50 {
+        stepper.frame_step_server_first(1);
+        if let Some(client_entity) = stepper.client_apps[0]
+            .world()
+            .resource::<ServerEntityMap>()
+            .to_client()
+            .get(&server_entity)
+            .copied()
+        {
+            return client_entity;
+        }
+    }
+    mapped_client_entity(stepper, server_entity)
+}
+
+fn use_single_threaded_schedules(stepper: &mut ClientServerStepper) {
+    for app in core::iter::once(&mut stepper.server_app).chain(stepper.client_apps.iter_mut()) {
+        for (_, schedule) in app.world_mut().resource_mut::<Schedules>().iter_mut() {
+            schedule.set_executor(SingleThreadedExecutor::new());
+        }
+    }
+}
+
+fn assert_allocation_budget(
+    name: &str,
+    measurement: AllocationMeasurement,
+    budget: AllocationBudget,
+) {
+    // Steady state means the work's own per-frame cost: what a frame of the
+    // work allocates over what an idle frame allocates. Comparing windows must
+    // not be done on totals, because each window's total is dominated by the
+    // whole schedule (~160 KB per frame here) and a single one-off allocation
+    // shifts it — the same commit measured a prediction delta of 82_656 bytes
+    // and then 47_384 bytes on consecutive CI runs, with the difference living
+    // in the idle window (35_832 bytes of drift) while the active window held
+    // to 560 bytes. Medians over per-frame samples ignore those one-offs and
+    // keep the assertion on the recurring cost, which is what a regression
+    // would change.
+    let idle_allocations = measurement.idle_frames.median_allocations();
+    let active_allocations = measurement.active_frames.median_allocations();
+    assert!(
+        active_allocations <= idle_allocations + budget.max_allocations_per_frame,
+        "{name} added allocation calls per frame ({active_allocations} > \
+         {idle_allocations} + {}): {measurement:#?}",
+        budget.max_allocations_per_frame,
+    );
+
+    let idle_bytes = measurement.idle_frames.median_bytes_allocated();
+    let active_bytes = measurement.active_frames.median_bytes_allocated();
+    assert!(
+        active_bytes <= idle_bytes + budget.max_bytes_per_frame,
+        "{name} added allocated bytes per frame ({active_bytes} > \
+         {idle_bytes} + {}): {measurement:#?}",
+        budget.max_bytes_per_frame,
+    );
+
+    assert!(
+        measurement.active.reallocations <= measurement.idle.reallocations,
+        "{name} added reallocation calls beyond the idle pipeline: {measurement:#?}",
+    );
+    // Totals back the leak checks: memory retained across the whole window is a
+    // leak whether or not it lands on the frames the medians describe.
+    assert_eq!(
+        measurement.active.allocations, measurement.active.deallocations,
+        "{name} retained allocations after the measured steady-state window: {measurement:#?}",
+    );
+    assert_eq!(
+        measurement.active.bytes_allocated, measurement.active.bytes_deallocated,
+        "{name} retained allocated bytes after the measured steady-state window: {measurement:#?}",
+    );
+}

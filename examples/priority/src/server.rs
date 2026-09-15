@@ -1,82 +1,150 @@
-use bevy::utils::HashMap;
-use std::ops::Deref;
-
+use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
-
-pub use lightyear::prelude::server::*;
+use bevy_enhanced_input::prelude::{Action, ActionOf, Fire};
+use core::ops::Deref;
+use lightyear::connection::client::Connected;
+use lightyear::connection::host::{HostClient, HostServer};
+use lightyear::prelude::server::*;
 use lightyear::prelude::*;
+use lightyear_examples_common::shared::SEND_INTERVAL;
 
+use crate::automation::AutomationServerPlugin;
 use crate::protocol::*;
+use crate::shared;
 
-// Plugin for server-specific logic
 pub struct ExampleServerPlugin;
+
+#[derive(Component)]
+pub(crate) struct ServerAction;
 
 impl Plugin for ExampleServerPlugin {
     fn build(&self, app: &mut App) {
+        app.add_plugins(AutomationServerPlugin);
+        app.insert_resource(ReplicationMetadata::new(SEND_INTERVAL));
         app.init_resource::<Global>();
-        app.add_systems(Startup, init);
-        app.add_systems(
-            Update,
-            (handle_connections, (tick_timers, update_props).chain()),
-        );
+        app.add_systems(Startup, setup);
+        app.add_observer(handle_new_client);
+        app.add_observer(handle_connected);
+        app.add_observer(movement);
+        app.add_systems(Update, (tick_timers, update_props).chain());
     }
 }
 
 const GRID_SIZE: f32 = 20.0;
-const NUM_CIRCLES: i32 = 6;
+const GRID_RADIUS: i32 = 3;
+const HIGH_PROP_PRIORITY: f32 = 1.0;
+const MEDIUM_PROP_PRIORITY: f32 = 0.025;
+const LOW_PROP_PRIORITY: f32 = 0.0125;
 
 #[derive(Resource, Default)]
 pub(crate) struct Global {
-    pub client_id_to_entity_id: HashMap<ClientId, Entity>,
+    pub client_id_to_entity_id: HashMap<PeerId, Entity>,
 }
 
-pub(crate) fn init(mut commands: Commands) {
-    commands.start_server();
-    commands.spawn(
-        TextBundle::from_section(
-            "Server",
-            TextStyle {
-                font_size: 30.0,
-                color: Color::WHITE,
-                ..default()
-            },
-        )
-        .with_style(Style {
-            align_self: AlignSelf::End,
-            ..default()
-        }),
-    );
+// System to spawn the initial grid of dots
+pub(crate) fn setup(mut commands: Commands) {
     // spawn dots in a grid
-    for x in -NUM_CIRCLES..NUM_CIRCLES {
-        for y in -NUM_CIRCLES..NUM_CIRCLES {
+    for x in -GRID_RADIUS..=GRID_RADIUS {
+        for y in -GRID_RADIUS..=GRID_RADIUS {
+            let position = Position(Vec2::new(x as f32 * GRID_SIZE, y as f32 * GRID_SIZE));
+            let priority = match y.abs() {
+                0 => LOW_PROP_PRIORITY,
+                1 => MEDIUM_PROP_PRIORITY,
+                _ => HIGH_PROP_PRIORITY,
+            };
             commands.spawn((
-                Position(Vec2::new(x as f32 * GRID_SIZE, y as f32 * GRID_SIZE)),
+                position,
                 Shape::Circle,
                 ShapeChangeTimer(Timer::from_seconds(2.0, TimerMode::Repeating)),
-                Replicate {
-                    // A ReplicationGroup is replicated together as a single message, so the priority should
-                    // be set on the group.
-                    // A group with priority 2.0 will be replicated twice as often as a group with priority 1.0
-                    // in case the bandwidth is saturated.
-                    // The priority can be sent when the entity is spawned; if multiple entities in the same group have
-                    // different priorities, the latest set priority will be used.
-                    // After the entity is spawned, you can update the priority using the ConnectionManager::update_priority method.
-                    group: ReplicationGroup::default().set_priority(1.0 + y.abs() as f32),
-                    ..default()
-                },
+                ReplicatePriority(priority),
+                Replicate::to_clients(NetworkTarget::All),
             ));
         }
     }
 }
 
-/// Server connection system, create a player upon connection
-pub(crate) fn handle_connections(
-    mut connections: EventReader<ConnectEvent>,
+/// Add the ReplicationSender component to new clients
+pub(crate) fn handle_new_client(trigger: On<Add, LinkOf>, mut commands: Commands) {
+    info!("New client connected: {:?}", trigger.entity);
+    commands.entity(trigger.entity).insert((
+        ReplicationSender,
+        // limit to 3KB/s
+        Transport::new(PriorityConfig::new(3000)),
+    ));
+}
+
+/// Spawn the player entity when a client connects
+pub(crate) fn handle_connected(
+    trigger: On<Add, Connected>,
+    query: Query<&RemoteId, With<ClientOf>>,
     mut commands: Commands,
 ) {
-    for connection in connections.read() {
-        let client_id = connection.client_id;
-        let entity = commands.spawn(PlayerBundle::new(client_id, Vec2::splat(300.0)));
+    let Ok(client_id) = query.get(trigger.entity) else {
+        return;
+    };
+    let client_id = client_id.0;
+    let h = (((client_id.to_bits().wrapping_mul(30)) % 360) as f32) / 360.0;
+    let s = 0.8;
+    let l = 0.5;
+    let color = Color::hsl(h, s, l);
+    let entity = commands
+        .spawn((
+            Player,
+            PlayerId(client_id),
+            Position(Vec2::splat(300.0)),
+            PlayerColor(color),
+            Replicate::to_clients(NetworkTarget::All),
+            PredictionTarget::to_clients(NetworkTarget::Single(client_id)),
+            InterpolationTarget::to_clients(NetworkTarget::AllExceptSingle(client_id)),
+            ControlledBy {
+                owner: trigger.entity,
+                lifetime: Default::default(),
+            },
+            Name::from("Player".to_string()),
+        ))
+        .id();
+    info!("Create entity {:?} for client {:?}", entity, client_id);
+    spawn_action_entities(&mut commands, entity);
+}
+
+/// Spawn the BEI action entity for a player.
+///
+/// The server owns and replicates action entities so the owning client can
+/// target them in input messages.
+///
+/// `InputPlugin<C>` installs `HierarchySendPlugin<ActionOf<C>>`, which makes
+/// each action entity replicate like its context entity. The action therefore
+/// does not need its own `Replicate` component.
+fn spawn_action_entities(commands: &mut Commands, player_entity: Entity) {
+    commands.spawn((
+        ActionOf::<Player>::new(player_entity),
+        Action::<Movement>::new(),
+        ServerAction,
+    ));
+}
+
+/// Read client inputs and move players
+fn movement(
+    trigger: On<Fire<Movement>>,
+    host_server: Query<(), With<HostServer>>,
+    server_actions: Query<(), (With<Action<Movement>>, With<ServerAction>)>,
+    controlled_by: Query<&ControlledBy>,
+    host_clients: Query<(), With<HostClient>>,
+    mut position_query: Query<&mut Position>,
+) {
+    let is_host_server = !host_server.is_empty();
+    if is_host_server && !server_actions.contains(trigger.action) {
+        return;
+    }
+    if is_host_server {
+        if let Ok(controlled_by) = controlled_by.get(trigger.context) {
+            if host_clients.get(controlled_by.owner).is_ok() {
+                return;
+            }
+        }
+    }
+    if let Ok(position) = position_query.get_mut(trigger.context) {
+        shared::shared_movement_behaviour(position, trigger.value);
     }
 }
 

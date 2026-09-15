@@ -1,88 +1,142 @@
 //! This example showcases how to use Lightyear with Bevy, to easily get replication along with prediction/interpolation working.
 //!
 //! There is a lot of setup code, but it's mostly to have the examples work in all possible configurations of transport.
-//! (all transports are supported, as well as running the example in listen-server or host-server mode)
+//! (all transports are supported, as well as running the example in client-and-server or host-server mode)
 //!
 //!
 //! Run with
 //! - `cargo run -- server`
 //! - `cargo run -- client -c 1`
 #![allow(unused_imports)]
+#![allow(unused_mut)]
 #![allow(unused_variables)]
 #![allow(dead_code)]
-use crate::client::ExampleClientPlugin;
-use crate::server::ExampleServerPlugin;
-use crate::shared::SharedPlugin;
-use bevy::prelude::*;
-use lightyear::prelude::{Deserialize, Serialize};
-use lightyear_examples_common::app::{Apps, Cli};
-use lightyear_examples_common::settings::{read_settings, ServerTransports, Settings};
 
+use bevy::prelude::*;
+use core::time::Duration;
+use lightyear::prelude::{LinkConditionerConfig, PeerId, RecvLinkConditioner};
+use lightyear_examples_common::cli::{Cli, Mode};
+use lightyear_examples_common::shared::{
+    CLIENT_PORT, FIXED_TIMESTEP_HZ, SERVER_ADDR, SERVER_PORT, SHARED_SETTINGS,
+};
+
+#[cfg(feature = "client")]
+use crate::client::ExampleClientPlugin;
+use crate::shared::SharedPlugin;
+
+mod automation;
+#[cfg(feature = "client")]
 mod client;
+mod debug;
 mod protocol;
+
+#[cfg(feature = "gui")]
+mod renderer;
 mod server;
 mod shared;
 
 pub const HOST_SERVER_PORT: u16 = 5050;
+const HOST_SERVER_PORT_RANGE: u16 = 1000;
+
+pub fn host_server_port(host: PeerId) -> u16 {
+    HOST_SERVER_PORT + (host.to_bits() % u64::from(HOST_SERVER_PORT_RANGE)) as u16
+}
 
 fn main() {
-    let mut cli = Cli::default();
-    let settings_str = include_str!("../assets/settings.ron");
-    let mut settings = read_settings::<Settings>(settings_str);
+    let cli = Cli::default();
+    let headless = cli.headless();
+
+    let tick_duration = Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ);
+    let mut app = cli.build_app(tick_duration, true);
+
+    app.add_plugins(SharedPlugin);
+
+    let mut is_dedicated_server = true;
 
     // in this example, every client will actually launch in host-server mode
     // the reason is that we want every client to be able to be the 'host' of a lobby
     // so every client needs to have the ServerPlugins included in the app
-    match cli {
-        Cli::Client { client_id } => {
-            cli = Cli::HostServer { client_id };
-            // when the client acts as host, we will use port UDP:5050 for the transport
-            settings.server.transport = vec![ServerTransports::Udp {
-                local_port: HOST_SERVER_PORT,
-            }];
+    match cli.mode {
+        #[cfg(feature = "client")]
+        Some(Mode::Client { client_id }) => {
+            // we want every client to be able to act as host-server so we
+            // add the server plugins
+            app.add_plugins(lightyear::prelude::server::ServerPlugins { tick_duration });
+            is_dedicated_server = false;
         }
-        Cli::Server => {}
-        _ => {
-            panic!("This example only supports the modes Client and Server");
+        _ => {}
+    }
+
+    #[cfg(feature = "client")]
+    {
+        app.add_plugins(ExampleClientPlugin);
+        if matches!(cli.mode, Some(Mode::Client { .. })) {
+            use lightyear::prelude::Connect;
+            use lightyear_examples_common::client::{ClientTransports, ExampleClient};
+            let client = app
+                .world_mut()
+                .spawn(ExampleClient {
+                    client_id: cli
+                        .client_id()
+                        .expect("You need to specify a client_id via `-c ID`"),
+                    client_port: CLIENT_PORT,
+                    server_addr: SERVER_ADDR,
+                    conditioner: Some(RecvLinkConditioner::new(
+                        LinkConditionerConfig::average_condition().half(),
+                    )),
+                    // transport: ClientTransports::Udp,
+                    transport: ClientTransports::WebTransport,
+                    shared: SHARED_SETTINGS,
+                })
+                .id();
+            app.world_mut().trigger(Connect { entity: client })
         }
     }
 
-    // build the bevy app (this adds common plugins such as the DefaultPlugins)
-    // and returns the `ClientConfig` and `ServerConfig` so that we can modify them
-    let mut apps = Apps::new(settings.clone(), cli);
-    // we do not modify the configurations of the plugins, so we can just build
-    // the `ClientPlugins` and `ServerPlugins` plugin groups
-    apps.add_lightyear_plugins()
-        // add our plugins
-        .add_user_plugins(
-            ExampleClientPlugin { settings },
-            ExampleServerPlugin,
-            SharedPlugin,
-        );
-    // run the app
-    apps.run();
-}
+    {
+        use lightyear::connection::server::Start;
+        use lightyear_examples_common::server::WebTransportCertificateSettings;
+        use lightyear_examples_common::server::{ExampleServer, ServerTransports};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct MySettings {
-    pub common: Settings,
+        app.add_plugins(server::ExampleServerPlugin {
+            is_dedicated_server,
+        });
+        let port = match cli.mode {
+            Some(Mode::Server) => SERVER_PORT,
+            // in client mode, we still start a server in case the server becomes a host-server.
+            // Use a deterministic per-client port so multiple local clients do not all bind
+            // HOST_SERVER_PORT and accidentally connect back to their own standby server.
+            #[cfg(feature = "client")]
+            Some(Mode::Client { client_id }) => host_server_port(PeerId::Netcode(
+                client_id.expect("You need to specify a client_id via `-c ID`"),
+            )),
+            _ => panic!("Only server or client mode is supported in this example"),
+        };
+        let server = app
+            .world_mut()
+            .spawn(ExampleServer {
+                conditioner: Some(RecvLinkConditioner::new(
+                    LinkConditionerConfig::average_condition().half(),
+                )),
+                // transport: ServerTransports::Udp { local_port: port },
+                transport: ServerTransports::WebTransport {
+                    local_port: port,
+                    certificate: WebTransportCertificateSettings::default(),
+                },
+                shared: SHARED_SETTINGS,
+            })
+            .id();
+        // Client-mode apps keep a local server configured so they can later host a game,
+        // but it must stay stopped while they are still connected to the lobby server.
+        if matches!(cli.mode, Some(Mode::Server)) {
+            app.world_mut().trigger(Start { entity: server });
+        }
+    }
 
-    /// If true, we will predict the client's entities, but also the ball and other clients' entities!
-    /// This is what is done by RocketLeague (see [video](https://www.youtube.com/watch?v=ueEmiDM94IE))
-    ///
-    /// If false, we will predict the client's entities but simple interpolate everything else.
-    pub(crate) predict_all: bool,
+    #[cfg(feature = "gui")]
+    if !headless {
+        app.add_plugins(renderer::ExampleRendererPlugin);
+    }
 
-    /// By how many ticks an input press will be delayed?
-    /// This can be useful as a tradeoff between input delay and prediction accuracy.
-    /// If the input delay is greater than the RTT, then there won't ever be any mispredictions/rollbacks.
-    /// See [this article](https://www.snapnet.dev/docs/core-concepts/input-delay-vs-rollback/) for more information.
-    pub(crate) input_delay_ticks: u16,
-
-    /// If visual correction is enabled, we don't instantly snapback to the corrected position
-    /// when we need to rollback. Instead we interpolated between the current position and the
-    /// corrected position.
-    /// This controls the duration of the interpolation; the higher it is, the longer the interpolation
-    /// will take
-    pub(crate) correction_ticks_factor: f32,
+    app.run();
 }

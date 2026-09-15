@@ -1,81 +1,97 @@
+use bevy::ecs::relationship::Relationship;
 use bevy::prelude::*;
-use leafwing_input_manager::prelude::*;
-
-pub use lightyear::prelude::client::*;
+use lightyear::connection::host::HostServer;
+use lightyear::input::bei::prelude::{Action, ActionOf, Bindings, Cardinal, Fire};
+use lightyear::prelude::client::{InputDelayConfig, InputTimelineConfig};
 use lightyear::prelude::*;
 
+use crate::automation::AutomationClientPlugin;
 use crate::protocol::*;
+use crate::shared;
 
 pub struct ExampleClientPlugin;
 
 impl Plugin for ExampleClientPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<ActionState<Inputs>>();
-        app.add_systems(Startup, init);
-        app.add_systems(PreUpdate, handle_connection.after(MainSet::Receive));
-        app.add_systems(
-            Update,
-            (
-                add_input_map,
-                handle_predicted_spawn,
-                handle_interpolated_spawn,
-            ),
-        );
+        app.add_plugins(AutomationClientPlugin);
+        app.add_systems(Startup, configure_input_delay);
+        app.add_observer(player_movement);
+        app.add_observer(handle_interpolated_spawn);
+        app.add_observer(handle_predicted_spawn);
+        app.add_observer(add_bindings_to_controlled_actions);
     }
 }
 
-// Startup system for the client
-pub(crate) fn init(mut commands: Commands) {
-    commands.connect_client();
+fn configure_input_delay(mut commands: Commands) {
+    commands.insert_resource(
+        InputTimelineConfig::default().with_input_delay(InputDelayConfig::balanced()),
+    );
 }
 
-/// Listen for events to know when the client is connected, and spawn a text entity
-/// to display the client id
-pub(crate) fn handle_connection(
-    mut commands: Commands,
-    mut connection_event: EventReader<ConnectEvent>,
+/// Applies local movement only to predicted entities owned by this client.
+fn player_movement(
+    trigger: On<Fire<Movement>>,
+    _input_timeline: SyncedLocalTimeline,
+    _host_server: Query<(), With<HostServer>>,
+    #[cfg(feature = "server")] server_actions: Query<
+        (),
+        (With<Action<Movement>>, With<crate::server::ServerAction>),
+    >,
+    mut position_query: Query<&mut Position, With<Predicted>>,
 ) {
-    for event in connection_event.read() {
-        let client_id = event.client_id();
-        commands.spawn(TextBundle::from_section(
-            format!("Client {}", client_id),
-            TextStyle {
-                font_size: 30.0,
-                color: Color::WHITE,
-                ..default()
-            },
-        ));
+    #[cfg(feature = "server")]
+    if !_host_server.is_empty() && server_actions.contains(trigger.action) {
+        return;
+    }
+    if let Ok(position) = position_query.get_mut(trigger.context) {
+        shared::shared_movement_behaviour(position, trigger.value);
     }
 }
 
-/// When the player entity is replicated on the client, add a leafwing `InputMap` component on it
-/// so that we can control it
-pub(crate) fn add_input_map(
-    mut commands: Commands,
-    predicted_players: Query<Entity, (Added<PlayerId>, With<Predicted>)>,
+/// Lower the saturation on predicted entities so they are visually distinct.
+pub(crate) fn handle_predicted_spawn(
+    trigger: On<Add, (PlayerId, Predicted)>,
+    mut predicted: Query<&mut PlayerColor, With<Predicted>>,
 ) {
-    for player_entity in predicted_players.iter() {
-        commands.entity(player_entity).insert((
-            PlayerBundle::get_input_map(),
-            ActionState::<Inputs>::default(),
-        ));
+    let entity = trigger.entity;
+    if let Ok(mut color) = predicted.get_mut(entity) {
+        let hsva = Hsva {
+            saturation: 0.4,
+            ..Hsva::from(color.0)
+        };
+        color.0 = Color::from(hsva);
     }
 }
 
-/// When the predicted copy of the client-owned entity is spawned
-/// - assign it a different saturation
-pub(crate) fn handle_predicted_spawn(mut predicted: Query<&mut PlayerColor, Added<Predicted>>) {
-    for mut color in predicted.iter_mut() {
-        color.0.set_s(0.3);
+/// Add local movement bindings when we receive an Action entity for a player
+/// that we control.
+pub(crate) fn add_bindings_to_controlled_actions(
+    trigger: On<Add, (Action<Movement>, ActionOf<Player>)>,
+    actions: Query<(&ActionOf<Player>, Has<Bindings>), With<Action<Movement>>>,
+    controlled_players: Query<(), (With<Player>, With<Controlled>)>,
+    mut commands: Commands,
+) {
+    let Ok((action_of, has_bindings)) = actions.get(trigger.entity) else {
+        return;
+    };
+    if has_bindings || controlled_players.get(action_of.get()).is_err() {
+        return;
     }
+    commands
+        .entity(trigger.entity)
+        .insert(Bindings::spawn((Cardinal::wasd_keys(), Cardinal::arrows())));
 }
 
-/// When the interpolated copy of the client-owned entity is spawned
-/// - assign it a different saturation
+/// Lower the saturation on interpolated entities so they are visually distinct.
 pub(crate) fn handle_interpolated_spawn(
-    mut interpolated: Query<&mut PlayerColor, Added<Interpolated>>,
+    trigger: On<Add, PlayerColor>,
+    mut interpolated: Query<&mut PlayerColor, With<Interpolated>>,
 ) {
-    for mut color in interpolated.iter_mut() {
-        color.0.set_s(0.1);
+    if let Ok(mut color) = interpolated.get_mut(trigger.entity) {
+        let hsva = Hsva {
+            saturation: 0.1,
+            ..Hsva::from(color.0)
+        };
+        color.0 = Color::from(hsva);
     }
 }

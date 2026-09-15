@@ -7,13 +7,14 @@
 A library for writing server-authoritative multiplayer games with [Bevy](https://bevyengine.org/). Compatible with wasm
 via WebTransport.
 
-https://github.com/cBournhonesque/lightyear/assets/8112632/7b57d48a-d8b0-4cdd-a16f-f991a394c852
-
-*Demo using one server with 2 clients. The entity is predicted (slightly ahead of server) on the controlling client and
-interpolated (slightly behind server) on the other client.
-The server only sends updates to clients 10 times per second but the clients still see smooth updates.*
-
 ## Getting started
+
+For Bevy 0.19, add Lightyear to your project with:
+
+```toml
+[dependencies]
+lightyear = "0.30"
+```
 
 You can first check out the [examples](https://github.com/cBournhonesque/lightyear/tree/main/examples).
 
@@ -23,50 +24,37 @@ the [simple_box](https://github.com/cBournhonesque/lightyear/tree/main/examples/
 
 You can also find more information in this WIP [book](https://cbournhonesque.github.io/lightyear/book/).
 
+## Repository layout
+
+Workspace crate sources live under `crates/`, grouped by role. Directory names drop the `lightyear_` prefix, but Cargo package names keep it.
+
+- `crates/io`: low-level IO links and backends such as `aeronet`, `link`, `udp`, `crossbeam`, `websocket`, and `webtransport`
+- `crates/connection`: connection abstractions and adapters such as `connection`, `raw_connection`, `netcode`, and `steam`
+- `crates/core`: the top-level `lightyear` crate plus shared core, sync, utils, and frame interpolation crates
+- `crates/inputs`: input crates such as `inputs`, `inputs_native`, `input_bei`, and `inputs_leafwing`
+- `crates/replication`: replication, prediction, and interpolation crates
+- `crates/transport`: serialization, transport, and message crates
+- `crates/integration`: Bevy ecosystem integrations such as Avian
+- `crates/platform`, `crates/deterministic`, `crates/tools`, and `crates/tests`: platform support, deterministic replication, tooling, and test support
+
+## Related projects
+
+- [lightyear-template](https://github.com/Piefayth/lightyear-template/tree/main): opiniated template for a bevy + lightyear starter project
+
+### Games
+
+- [Lumina](https://github.com/nixon-voxell/lumina)
+- [cycles.io](https://github.com/cBournhonesque/jam5) for bevy jam 5: https://cbournhonesque.itch.io/cyclesio
+
+
 ## Features
 
-### Ergonomic
 
-*Lightyear* provides a simple API for sending and receiving messages, and for replicating entities and components:
-
-- the user needs to define a shared protocol that defines all the `Messages`, `Components`, `Inputs` that can be sent over
-  the network; as well as the `Channels` to be used:
-```rust,ignore
-// messages
-app.add_message::<Message1>(ChannelDirection::Bidirectional);
-
-// inputs
-app.add_plugins(InputPlugin::<Inputs>::default());
-
-// components
-app.register_component::<PlayerId>(ChannelDirection::ServerToClient)
-    .add_prediction(ComponentSyncMode::Once)
-    .add_interpolation(ComponentSyncMode::Once);
-    
-// channels
-app.add_channel::<Channel1>(ChannelSettings {
-    mode: ChannelMode::OrderedReliable(ReliableSettings::default()),
-    ..default()
-});
-```
-- to enable replication, the user just needs to add a `Replicate` bundle to entities that need to be replicated.
-- all network-related events are accessible via bevy `Events`: `EventReader<MessageEvent<MyMessage>>` or `EventReader<EntitySpawnEvent>`
-- I provide a certain number of bevy `Resources` to interact with the library (`InputManager`, `ConnectionManager`, `TickManager`,
-  etc.)
-
-
-### Batteries-included
-
-- Transport-agnostic: *Lightyear* uses a very
-  general [Transport](https://github.com/cBournhonesque/lightyear/blob/main/lightyear/src/transport/mod.rs) trait to
-  send raw data on the network.
-  The trait currently has several implementations:
+- Transport-agnostic: *Lightyear* is compatible with a number of IO backends, including:
     - UDP sockets
-    - WebTransport (using QUIC): available on both native and wasm!
-    - WebSocket: available on both native and wasm!
-    - Steam: use the SteamWorks SDK to send messages over the Steam network
+    - Uses [`aeronet`](https://github.com/aecsocket/aeronet) for WebSocket, Steam and WebTransport support
 - Serialization
-    - *Lightyear* uses `bincode` as a default serializer, but you can provide your own serialization function
+    - *Lightyear* uses `postcard` as a default serializer, but you can provide your own serialization function
 - Message passing
     - *Lightyear* supports sending packets with different guarantees of ordering and reliability through the use of
       channels.
@@ -79,40 +67,39 @@ app.add_channel::<Channel1>(ChannelSettings {
     - With the `leafwing` feature, there is a special integration with
       the [`leafwing-input-manager`](https://github.com/Leafwing-Studios/leafwing-input-manager) crate, where
       your `leafwing` inputs are networked for you!
+    - Also supports the [`bevy-enhanced-input`](https://github.com/projectharmonia/bevy_enhanced_input) crate!
+- Deterministic replication
+    - *Lightyear* supports deterministic replication when only inputs are replicated. The simulation needs to be deterministic.
+      The deterministic replication is compatible with both lockstep and prediction/rollback.
 - World Replication
-    - Entities that have the `Replicate` bundle will be automatically replicated to clients. Only the components that
-      change will be sent over the network. This functionality is similar to what [bevy_replicon](https://github.com/lifescapegame/bevy_replicon) provides.
+    - `lightyear` uses [`bevy_replicon`](https://github.com/simgine/bevy_replicon) to enable world replication features
+      (replication, interest management, pre-spawning, etc.)
 - Advanced replication
     - **Client-side prediction**: with just a one-line change, you can enable client-prediction with rollback on the
       client, so that your inputs can feel responsive
     - **Snapshot interpolation**: with just a one-line change, you can enable Snapshot interpolation so that entities
       are smoothly interpolated even if replicated infrequently.
-    - **Client-authoritative replication**: you can also replicate entities from the client to the server.
-    - **Pre-spawning predicted entities**: you can spawn Predicted entities on the client first, and then transfer the
-      authority to
-      the server. This ensures that the entity is spawned immediately, but will still be controlled by the server.
-    - **Entity mapping**: *lightyear* also supports replicating components/messages that contain references to other
-      entities. The entities will be mapped from the local World to the remote World.
-    - **Interest management**: *lightyear* supports replicating only a subset of the World to clients. Interest
-      management is made flexible by the use of `Rooms`
     - **Input Delay**: you can add a custom amount of input-delay as a trade-off between having a more responsive game
-      or more mis-predictions
+      or more miss-predictions
     - **Bandwidth Management**: you can set a cap to the bandwidth for the connection. Then messages will be sent in
       decreasing order of priority (that you can set yourself), with a priority-accumulation scheme
-- Configurable
-    - *Lightyear* is highly configurable: you can configure the size of the input buffer, the amount of
-      interpolation-delay, the packet send rate, etc.
-      All the configurations are accessible through the `ClientConfig` and `ServerConfig` structs.
-- Observability
-    - *Lightyear* uses the `tracing` and `metrics` libraries to emit spans and logs around most events (
-      sending/receiving messages, etc.). The metrics can be exported to Prometheus for analysis.
+    - **Lag Compensation** is available so that predicted entities can interact with interpolated entities (used most often for fps games)
+- Various topologies supported
+    - You can run your app in client-server mode or in P2P mode. You can also have a client act as the server (host-client mode).
 - Examples
     - *Lightyear* has plenty of examples demonstrating all these features, as well as the integration with other bevy
-      crates such as `bevy_xpbd_2d`
+      crates such as `avian`
+
 
 ## Supported bevy version
 
 | Lightyear | Bevy |
 |-----------|------|
+| 0.28-0.30 | 0.19 |
+| 0.26-0.27 | 0.18 |
+| 0.25      | 0.17 |
+| 0.20-0.24 | 0.16 |
+| 0.18-0.19 | 0.15 |
+| 0.16-0.17 | 0.14 |
 | 0.10-0.15 | 0.13 |
 | 0.1-0.9   | 0.12 |

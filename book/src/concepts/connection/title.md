@@ -11,24 +11,24 @@ To establish that connection, that needs to be some machinery that runs on top o
 - storing the list of connected remote peers
 - etc.
 
-`lightyear` uses the traits `NetClient` and `NetServer` to abstract over the connection logic.
+Connection logic lives in components you add to the link entity, next to the IO component.
 
 Multiple implementations are provided:
-- Netcode
-- Steam
-- Local
+- Netcode (`NetcodeClient` / `NetcodeServer`)
+- Steam (`SteamClientIo` / `SteamEndpoint`; add `Server` for the authoritative role)
+- Local (`CrossbeamIo`, in-memory, for tests and host-server mode)
 
 
 ## Netcode
 
 This implementation is based on the [netcode.io](https://github.com/networkprotocol/netcode/blob/master/STANDARD.md) standard created
 by Glenn Fiedler (of GafferOnGames fame). It describes a protocol to establish a secure connection between two peers, provided
-that there is an unoredered unreliable transport layer to exchange packets.
+that there is an unordered unreliable transport layer to exchange packets.
 
 For my purpose I am using [this](https://github.com/benny-n/netcode) Rust implementation of the standard.
 
-You can use the Netcode connection by using the `NetcodeClient` and `NetcodeServer` structs, coupled with any of the available
-transports (Udp, WebTransport, etc.)
+You use the Netcode connection by adding the `NetcodeClient` or `NetcodeServer` component, coupled with any of the available
+IO components (`UdpIo`, `WebTransportClientIo`, etc.)
 
 To connect to a game server, the client needs to send a `ConnectToken` to the game server to start the connection process.
 
@@ -41,7 +41,7 @@ establish secure connection.
 You can use `Authentication::Manual` for those cases.
 
 Currently `lightyear` does not provide any functionality to let a game server send a `ConnectToken` securely to a client.
-You will have to handle this logic youself.
+You will have to handle this logic yourself.
 
 
 ## Steam

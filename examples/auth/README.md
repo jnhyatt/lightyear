@@ -15,19 +15,23 @@ that listens on a TCP socket for incoming requests. For every request, it will g
 to the client. The client can then use the `ConnectToken` to start the `lightyear` connection.
 
 
-## Running the example
+## Running an example
 
-There are different 'modes' of operation:
+- Run the server with a GUI: `cargo run -- --headless=false server`
+- Run client with id 1: `cargo run -- client -c 1`
 
-- as a dedicated server with `cargo run -- server`
-- as a listen server with `cargo run -- listen-server`. This will launch 2 independent bevy apps (client and server) in
-  separate threads.
-  They will communicate via channels (so with almost 0 latency)
-- as a listen server with `cargo run -- host-server`. This will launch a single bevy app, where the server will also act
-  as a client. Functionally, it is similar to the "listen-server" mode, but you have a single bevy `World` instead of
-  separate client and server `Worlds`s.
+[//]: # (- Run the client and server in two separate bevy Apps: `cargo run` or `cargo run separate`)
+- Run the server without a gui: `cargo run --no-default-features --features=server -- server`
+- Run the client and server in "HostClient" mode, where the client also acts as server (both are in the same App) : `cargo run -- host-client -c 0`
 
-Then you can launch clients with the commands:
-- `cargo run -- client`
+You can control the behaviour of the example by changing the list of features. By default, all features are enabled (client, server, gui).
+For example you can run the server in headless mode (without gui) by running `cargo run --no-default-features --features=server,webtransport,netcode`.
 
-You can modify the file `assets/settings.ron` to modify some networking settings.
+### Testing in wasm with webtransport
+
+NOTE: I am using the [bevy cli](https://github.com/TheBevyFlock/bevy_cli) to build and serve the wasm example.
+
+To test the example in wasm, you can run the following commands: `bevy run web`
+
+The repo includes a pre-generated self-signed WebTransport certificate and digest, so you do not need to run the certificate generator for the usual local workflow while that certificate is valid. If it expires, or if you want to replace it, generate a new temporary self-signed certificate with:
+- `cargo run -p generate_certificate` (writes `certificates/cert.pem`, `certificates/key.pem`, and `certificates/digest.txt`; rebuild wasm clients after regenerating so they embed the new digest)

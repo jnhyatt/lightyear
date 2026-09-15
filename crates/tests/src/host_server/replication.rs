@@ -1,0 +1,399 @@
+use crate::protocol::CompA;
+use crate::stepper::*;
+use bevy::prelude::{Entity, With};
+use bevy_replicon::prelude::Remote;
+use bevy_replicon::shared::server_entity_map::ServerEntityMap;
+use lightyear::prelude::{client::Connect, server::Start};
+use lightyear_connection::network_target::NetworkTarget;
+use lightyear_core::id::RemoteId;
+use lightyear_core::interpolation::Interpolated;
+use lightyear_core::prediction::Predicted;
+use lightyear_replication::control::{Controlled, ControlledBy, ControlledSend};
+use lightyear_replication::prelude::*;
+use lightyear_replication::send::ReplicatedFrom;
+use test_log::test;
+
+fn host_only_stepper_before_host_connect() -> ClientServerStepper {
+    let mut config =
+        StepperConfig::from_connection_types(vec![ClientType::Host], ServerType::Netcode);
+    config.init = false;
+    let mut stepper = ClientServerStepper::from_config(config);
+    stepper.server_app.finish();
+    stepper.server_app.cleanup();
+    stepper.server_app.world_mut().trigger(Start {
+        entity: stepper.server_entity,
+    });
+    stepper.server_app.world_mut().flush();
+    stepper
+}
+
+fn connect_host(stepper: &mut ClientServerStepper) -> Entity {
+    let host_client_entity = stepper.host_client_entity.unwrap();
+    stepper.server_app.world_mut().trigger(Connect {
+        entity: host_client_entity,
+    });
+    stepper.server_app.world_mut().flush();
+    host_client_entity
+}
+
+/// In host-server mode, spawning an entity with `Replicate` should add
+/// `ReplicatedFrom` because the host-client sees the entity through the host sender.
+#[test]
+fn test_replicate_adds_replicated_from() {
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::host_server());
+
+    let server_entity = stepper
+        .server_app
+        .world_mut()
+        .spawn((Replicate::to_clients(NetworkTarget::All),))
+        .id();
+    stepper.frame_step(1);
+
+    let entity_ref = stepper.server_app.world().entity(server_entity);
+    assert!(
+        entity_ref.contains::<ReplicatedFrom>(),
+        "entity should have ReplicatedFrom in host-server mode"
+    );
+}
+
+/// In host-server mode, spawning an entity with `PredictionTarget` should
+/// add the `Predicted` marker component.
+#[test]
+fn test_prediction_target_adds_predicted() {
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::host_server());
+
+    let server_entity = stepper
+        .server_app
+        .world_mut()
+        .spawn((
+            Replicate::to_clients(NetworkTarget::All),
+            PredictionTarget::to_clients(NetworkTarget::All),
+        ))
+        .id();
+    stepper.frame_step(1);
+
+    let entity_ref = stepper.server_app.world().entity(server_entity);
+    assert!(
+        entity_ref.contains::<PredictedSend>(),
+        "PredictionTarget should add the sender-side marker"
+    );
+    assert!(
+        entity_ref.contains::<Predicted>(),
+        "entity should have Predicted in host-server mode"
+    );
+}
+
+/// In host-server mode, spawning an entity with `InterpolationTarget` should
+/// add the `Interpolated` marker component.
+#[test]
+fn test_interpolation_target_adds_interpolated() {
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::host_server());
+
+    let server_entity = stepper
+        .server_app
+        .world_mut()
+        .spawn((
+            Replicate::to_clients(NetworkTarget::All),
+            InterpolationTarget::to_clients(NetworkTarget::All),
+        ))
+        .id();
+    stepper.frame_step(1);
+
+    let entity_ref = stepper.server_app.world().entity(server_entity);
+    assert!(
+        entity_ref.contains::<InterpolatedSend>(),
+        "InterpolationTarget should add the sender-side marker"
+    );
+    assert!(
+        entity_ref.contains::<Interpolated>(),
+        "entity should have Interpolated in host-server mode"
+    );
+}
+
+/// Spawning a host-owned entity with `ControlledBy` should add the sender
+/// marker and the host-local receiver marker.
+#[test]
+fn test_host_owned_controlled_by_adds_local_controlled() {
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::host_server());
+
+    let host_client_entity = stepper.host_client_entity.unwrap();
+    let server_entity = stepper
+        .server_app
+        .world_mut()
+        .spawn((
+            Replicate::to_clients(NetworkTarget::All),
+            ControlledBy {
+                owner: host_client_entity,
+                lifetime: Default::default(),
+            },
+        ))
+        .id();
+    stepper.frame_step(1);
+
+    let entity_ref = stepper.server_app.world().entity(server_entity);
+    assert!(
+        entity_ref.contains::<ControlledSend>(),
+        "entity should have ControlledSend via #[require(ControlledSend)] on ControlledBy"
+    );
+    assert!(
+        entity_ref.contains::<Controlled>(),
+        "host-owned entity should have host-local Controlled in host-server mode"
+    );
+}
+
+#[test]
+fn test_remote_owned_controlled_by_does_not_add_local_controlled_on_host_server() {
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::host_server());
+
+    let remote_client_entity = stepper.client_of_entities[0];
+    let server_entity = stepper
+        .server_app
+        .world_mut()
+        .spawn((
+            Replicate::to_clients(NetworkTarget::All),
+            ControlledBy {
+                owner: remote_client_entity,
+                lifetime: Default::default(),
+            },
+        ))
+        .id();
+    stepper.frame_step(1);
+
+    let entity_ref = stepper.server_app.world().entity(server_entity);
+    assert!(
+        entity_ref.contains::<ControlledSend>(),
+        "entity should have ControlledSend via #[require(ControlledSend)] on ControlledBy"
+    );
+    assert!(
+        !entity_ref.contains::<Controlled>(),
+        "remote-owned server entity should not have host-local Controlled"
+    );
+}
+
+#[test]
+fn test_replicate_backfills_when_client_becomes_host_client() {
+    let mut stepper = host_only_stepper_before_host_connect();
+
+    let server_entity = stepper
+        .server_app
+        .world_mut()
+        .spawn((Replicate::to_clients(NetworkTarget::All),))
+        .id();
+    stepper.frame_step(1);
+
+    let entity_ref = stepper.server_app.world().entity(server_entity);
+    assert!(
+        !entity_ref.contains::<ReplicatedFrom>(),
+        "ReplicatedFrom should not exist before the client becomes a HostClient"
+    );
+
+    connect_host(&mut stepper);
+    stepper.frame_step(1);
+
+    let entity_ref = stepper.server_app.world().entity(server_entity);
+    assert!(
+        entity_ref.contains::<ReplicatedFrom>(),
+        "late host-client backfill should add ReplicatedFrom for existing replicated entities"
+    );
+}
+
+#[test]
+fn test_prediction_target_backfills_predicted_when_client_becomes_host_client() {
+    let mut stepper = host_only_stepper_before_host_connect();
+
+    let server_entity = stepper
+        .server_app
+        .world_mut()
+        .spawn((
+            Replicate::to_clients(NetworkTarget::All),
+            PredictionTarget::to_clients(NetworkTarget::All),
+        ))
+        .id();
+    stepper.frame_step(1);
+
+    assert!(
+        !stepper
+            .server_app
+            .world()
+            .entity(server_entity)
+            .contains::<Predicted>(),
+        "the authoritative entity should not be Predicted before it has a host-local receiver"
+    );
+    assert!(
+        stepper
+            .server_app
+            .world()
+            .entity(server_entity)
+            .contains::<PredictedSend>(),
+        "PredictionTarget should retain its sender-side marker"
+    );
+
+    connect_host(&mut stepper);
+    stepper.frame_step(1);
+
+    assert!(
+        stepper
+            .server_app
+            .world()
+            .entity(server_entity)
+            .contains::<Predicted>(),
+        "Predicted should be added after the client becomes a HostClient"
+    );
+}
+
+#[test]
+fn test_interpolation_target_backfills_interpolated_when_client_becomes_host_client() {
+    let mut stepper = host_only_stepper_before_host_connect();
+
+    let server_entity = stepper
+        .server_app
+        .world_mut()
+        .spawn((
+            Replicate::to_clients(NetworkTarget::All),
+            InterpolationTarget::to_clients(NetworkTarget::All),
+        ))
+        .id();
+    stepper.frame_step(1);
+
+    assert!(
+        !stepper
+            .server_app
+            .world()
+            .entity(server_entity)
+            .contains::<Interpolated>(),
+        "the authoritative entity should not be Interpolated before it has a host-local receiver"
+    );
+    assert!(
+        stepper
+            .server_app
+            .world()
+            .entity(server_entity)
+            .contains::<InterpolatedSend>(),
+        "InterpolationTarget should retain its sender-side marker"
+    );
+
+    connect_host(&mut stepper);
+    stepper.frame_step(1);
+
+    assert!(
+        stepper
+            .server_app
+            .world()
+            .entity(server_entity)
+            .contains::<Interpolated>(),
+        "Interpolated should be added after the client becomes a HostClient"
+    );
+}
+
+#[test]
+fn test_controlled_backfills_when_client_becomes_host_client() {
+    let mut stepper = host_only_stepper_before_host_connect();
+    let host_client_entity = stepper.host_client_entity.unwrap();
+
+    let server_entity = stepper
+        .server_app
+        .world_mut()
+        .spawn((
+            Replicate::to_clients(NetworkTarget::All),
+            ControlledBy {
+                owner: host_client_entity,
+                lifetime: Default::default(),
+            },
+        ))
+        .id();
+    stepper.frame_step(1);
+
+    assert!(
+        stepper
+            .server_app
+            .world()
+            .entity(server_entity)
+            .contains::<ControlledSend>(),
+        "ControlledSend is added by ControlledBy before the host-local observer runs"
+    );
+    assert!(
+        !stepper
+            .server_app
+            .world()
+            .entity(server_entity)
+            .contains::<Controlled>(),
+        "Controlled should not be present before the owner becomes a HostClient"
+    );
+
+    connect_host(&mut stepper);
+    stepper.frame_step(1);
+
+    assert!(
+        stepper
+            .server_app
+            .world()
+            .entity(server_entity)
+            .contains::<Controlled>(),
+        "Controlled should still be present after the client becomes a HostClient"
+    );
+}
+
+#[test]
+fn test_host_owned_entity_does_not_loop_back_and_can_rebroadcast() {
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::host_server());
+    let host_id = stepper.host_client().get::<RemoteId>().unwrap().0;
+
+    let host_entity = stepper
+        .server_app
+        .world_mut()
+        .spawn((Replicate::to_server(), CompA(1.0)))
+        .id();
+
+    stepper.frame_step(2);
+
+    let remote_copies = stepper
+        .server_app
+        .world_mut()
+        .query_filtered::<Entity, (With<CompA>, With<Remote>)>()
+        .iter(stepper.server_app.world())
+        .count();
+    assert_eq!(
+        remote_copies, 0,
+        "host-owned entities should not be looped back through the client-send endpoint"
+    );
+
+    stepper
+        .server_app
+        .world_mut()
+        .entity_mut(host_entity)
+        .insert(Replicate::to_clients(NetworkTarget::AllExceptSingle(
+            host_id,
+        )));
+
+    stepper.frame_step(2);
+
+    let remote_client_entity = stepper.client_apps[0]
+        .world()
+        .resource::<ServerEntityMap>()
+        .to_client()
+        .get(&host_entity)
+        .copied()
+        .expect("remote client should receive the rebroadcast entity");
+
+    assert_eq!(
+        stepper.client_apps[0]
+            .world()
+            .get::<CompA>(remote_client_entity),
+        Some(&CompA(1.0))
+    );
+
+    stepper
+        .server_app
+        .world_mut()
+        .entity_mut(host_entity)
+        .insert(CompA(2.0));
+    stepper.frame_step(2);
+
+    assert_eq!(
+        stepper.client_apps[0]
+            .world()
+            .get::<CompA>(remote_client_entity),
+        Some(&CompA(2.0)),
+        "rebroadcast client should receive subsequent updates from the host-owned entity"
+    );
+}

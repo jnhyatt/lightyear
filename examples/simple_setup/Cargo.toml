@@ -1,9 +1,8 @@
 [package]
 name = "simple_setup"
-version = "0.1.0"
+version = "0.30.0"
 authors = ["Charles Bournhonesque <charlesbour@gmail.com>"]
 edition = "2021"
-rust-version = "1.65"
 description = "Examples for the lightyearServer-client networking library for the Bevy game engine"
 readme = "README.md"
 repository = "https://github.com/cBournhonesque/lightyear"
@@ -12,8 +11,34 @@ categories = ["game-development", "network-programming"]
 license = "MIT OR Apache-2.0"
 publish = false
 
+[features]
+default = ["client", "server", "udp"]
+netcode = ["lightyear/netcode"]
+webtransport = ["lightyear/webtransport"]
+client = ["lightyear/client", "lightyear/raw_connection"]
+gui = []
+server = ["lightyear/server"]
+udp = ["lightyear/udp"]
+
 [dependencies]
-lightyear = { path = "../../lightyear" }
-serde = { version = "1.0.188", features = ["derive"] }
-bevy = { version = "0.13", features = ["bevy_core_pipeline"] }
-clap = { version = "4.5.4", features = ["derive"] }
+clap.workspace = true
+lightyear = { workspace = true, features = ["replication"] }
+bevy = { workspace = true, features = [
+  "2d",
+  "2d_bevy_render",
+  "2d_api",
+  "bevy_ui",
+  "bevy_ui_render",
+  "bevy_render",
+  "bevy_core_pipeline",
+  "bevy_winit",
+  "bevy_window",
+  "x11",
+  "wayland",
+] }
+serde.workspace = true
+async-compat.workspace = true
+
+
+[lints]
+workspace = true

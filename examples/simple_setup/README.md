@@ -1,10 +1,10 @@
 # Simple setup 
 
-This minmal example shows how to create a bevy app with the lightyear client and server plugins.
+This minimal example shows how to create a bevy app with the lightyear client and server plugins.
 
+It shows the minimum setup necessary to create client/server entities that can send messages to each other.
 
-## Running the example
+## Running an example
 
-You can run:
-- as a dedicated server with `cargo run -- server`
-- as a client with `cargo run --client`
+- Run the server: `cargo run -- server`
+- Run the client: `cargo run -- client`

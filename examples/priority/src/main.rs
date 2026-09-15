@@ -1,37 +1,59 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(dead_code)]
+use bevy::prelude::*;
+use core::time::Duration;
+use lightyear_examples_common::cli::{Cli, Mode};
+use lightyear_examples_common::shared::FIXED_TIMESTEP_HZ;
+
+#[cfg(feature = "client")]
 use crate::client::ExampleClientPlugin;
+#[cfg(feature = "server")]
 use crate::server::ExampleServerPlugin;
 use crate::shared::SharedPlugin;
-use bevy::prelude::*;
-use lightyear::prelude::server::PacketConfig;
-use lightyear_examples_common::app::{Apps, Cli};
-use lightyear_examples_common::settings::{read_settings, Settings};
 
+mod automation;
+#[cfg(feature = "client")]
 mod client;
+mod debug;
 mod protocol;
+#[cfg(feature = "gui")]
+mod renderer;
+#[cfg(feature = "server")]
 mod server;
 mod shared;
 
 fn main() {
     let cli = Cli::default();
-    let settings_str = include_str!("../assets/settings.ron");
-    let settings = read_settings::<Settings>(settings_str);
-    // build the bevy app (this adds common plugin such as the DefaultPlugins)
-    let mut apps = Apps::new(settings, cli);
-    // for this example, we will use input delay and a correction function
-    apps.update_lightyear_server_config(|config| {
-        // for this example, we will put a bandwidth cap on the server-side
-        config.packet = PacketConfig::default()
-            .enable_bandwidth_cap()
-            // we can set the max bandwidth to 56 KB/s
-            .with_send_bandwidth_bytes_per_second_cap(3000);
-    })
-    // add the `ClientPlugins` and `ServerPlugins` plugin groups
-    .add_lightyear_plugins()
-    // add our plugins
-    .add_user_plugins(ExampleClientPlugin, ExampleServerPlugin, SharedPlugin);
-    // run the app
-    apps.run();
+    let headless = cli.headless();
+
+    let mut app = cli.build_app(Duration::from_secs_f64(1.0 / FIXED_TIMESTEP_HZ), true);
+
+    app.add_plugins(SharedPlugin);
+
+    cli.spawn_connections(&mut app);
+
+    match cli.mode {
+        #[cfg(feature = "client")]
+        Some(Mode::Client { .. }) => {
+            app.add_plugins(ExampleClientPlugin);
+        }
+        #[cfg(feature = "server")]
+        Some(Mode::Server) => {
+            app.add_plugins(ExampleServerPlugin);
+        }
+        #[cfg(all(feature = "client", feature = "server"))]
+        Some(Mode::HostClient { client_id }) => {
+            app.add_plugins(ExampleClientPlugin);
+            app.add_plugins(ExampleServerPlugin);
+        }
+        _ => {}
+    }
+
+    #[cfg(feature = "gui")]
+    if !headless {
+        app.add_plugins(renderer::ExampleRendererPlugin);
+    }
+
+    app.run();
 }

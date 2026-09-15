@@ -1,0 +1,331 @@
+use crate::protocol::*;
+use crate::stepper::*;
+use bevy::ecs::entity::UniqueEntityArray;
+use bevy::prelude::*;
+use bevy_replicon::shared::server_entity_map::ServerEntityMap;
+use core::fmt::Debug;
+use lightyear::prelude::Message;
+use lightyear::prelude::*;
+use lightyear_connection::network_topology::NetworkingMetadata;
+use lightyear_messages::multi::MultiMessageSender;
+use test_log::test;
+use tracing::trace;
+
+#[derive(Resource)]
+struct Buffer<M>(Vec<(Entity, M)>);
+
+impl<M> Default for Buffer<M> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+/// System to check that we received the message on the server
+fn count_messages_observer<M: Message + Debug>(
+    mut receiver: Query<(Entity, &mut MessageReceiver<M>)>,
+    mut buffer: ResMut<Buffer<M>>,
+) {
+    receiver.iter_mut().for_each(|(entity, mut receiver)| {
+        receiver.receive().for_each(|m| buffer.0.push((entity, m)));
+    })
+}
+
+#[test]
+fn test_send_messages() {
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::single());
+    stepper.server_app.init_resource::<Buffer<StringMessage>>();
+    stepper
+        .server_app
+        .add_systems(Update, count_messages_observer::<StringMessage>);
+    stepper
+        .client_app()
+        .init_resource::<Buffer<StringMessage>>();
+    stepper
+        .client_app()
+        .add_systems(Update, count_messages_observer::<StringMessage>);
+
+    info!("Sending message from client to server");
+    let send_message = StringMessage("Hello".to_string());
+    stepper
+        .client_mut(0)
+        .get_mut::<MessageSender<StringMessage>>()
+        .unwrap()
+        .send::<Channel1>(send_message.clone());
+    stepper.frame_step(1);
+
+    let received_messages = stepper
+        .server_app
+        .world()
+        .resource::<Buffer<StringMessage>>();
+    assert_eq!(
+        &received_messages.0,
+        &vec![(stepper.client_of_entities[0], send_message)]
+    );
+
+    info!("Sending message from server to client");
+    let send_message = StringMessage("World".to_string());
+    stepper
+        .client_of_mut(0)
+        .get_mut::<MessageSender<StringMessage>>()
+        .unwrap()
+        .send::<Channel1>(send_message.clone());
+    stepper.frame_step(2);
+
+    let received_messages = stepper.client_apps[0]
+        .world()
+        .resource::<Buffer<StringMessage>>();
+    assert_eq!(
+        &received_messages.0,
+        &vec![(stepper.client_entities[0], send_message)]
+    );
+}
+
+#[derive(Resource)]
+struct TriggerBuffer<M>(Vec<(Entity, M)>);
+
+impl<M> Default for TriggerBuffer<M> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+/// System to check that we received the message on the server
+fn count_triggers_observer<M: Event + Debug + Clone>(
+    trigger: On<RemoteEvent<M>>,
+    metadata: Res<NetworkingMetadata>,
+    mut buffer: ResMut<TriggerBuffer<M>>,
+) {
+    info!("Received trigger: {:?}", trigger);
+    // Get the entity that is 'receiving' the trigger
+    let remote = *metadata.peer_map.get(&trigger.from).unwrap();
+    buffer.0.push((remote, trigger.trigger.clone()));
+}
+
+#[test]
+fn test_send_triggers() {
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::single());
+    stepper
+        .server_app
+        .add_observer(count_triggers_observer::<StringTrigger>);
+    stepper
+        .server_app
+        .init_resource::<TriggerBuffer<StringTrigger>>();
+
+    trace!("Sending trigger from client to server");
+    let send_trigger = StringTrigger("Hello".to_string());
+    stepper
+        .client_mut(0)
+        .get_mut::<EventSender<StringTrigger>>()
+        .unwrap()
+        .trigger::<Channel1>(send_trigger.clone());
+    stepper.frame_step(1);
+
+    assert_eq!(
+        &stepper
+            .server_app
+            .world()
+            .resource::<TriggerBuffer<StringTrigger>>()
+            .0,
+        &vec![(stepper.client_of_entities[0], send_trigger,)]
+    );
+}
+
+#[derive(Resource)]
+struct EntityTriggerBuffer<M>(Vec<(Entity, M, Entity)>);
+
+impl<M> Default for EntityTriggerBuffer<M> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+/// System to check that we received the message on the server
+fn count_entity_triggers_observer<M: EntityEvent + Debug + Clone>(
+    trigger: On<RemoteEvent<M>>,
+    metadata: Res<NetworkingMetadata>,
+    mut buffer: ResMut<EntityTriggerBuffer<M>>,
+) {
+    info!("Received trigger: {:?}", trigger);
+    // Get the entity that is 'receiving' the trigger
+    let remote = *metadata.peer_map.get(&trigger.from).unwrap();
+    buffer.0.push((
+        remote,
+        trigger.trigger.clone(),
+        trigger.trigger.event_target(),
+    ));
+}
+
+#[test]
+fn test_send_triggers_map_entities() {
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::single());
+    let server_entity = stepper
+        .server_app
+        .world_mut()
+        .spawn(Replicate::to_clients(NetworkTarget::All))
+        .id();
+    stepper.frame_step(2);
+    let client_entity = stepper.client_apps[0]
+        .world()
+        .resource::<ServerEntityMap>()
+        .to_client()
+        .get(&server_entity)
+        .copied()
+        .expect("entity is not present in entity map");
+
+    stepper
+        .client_app()
+        .add_observer(count_entity_triggers_observer::<EntityTrigger>);
+    stepper
+        .client_app()
+        .init_resource::<EntityTriggerBuffer<EntityTrigger>>();
+
+    trace!("Sending trigger from server to client");
+    let send_trigger = EntityTrigger(server_entity);
+    stepper
+        .client_of_mut(0)
+        .get_mut::<EventSender<EntityTrigger>>()
+        .unwrap()
+        .trigger::<Channel1>(send_trigger.clone());
+    stepper.frame_step(2);
+
+    assert_eq!(
+        &stepper.client_apps[0]
+            .world()
+            .resource::<EntityTriggerBuffer<EntityTrigger>>()
+            .0,
+        &vec![(
+            stepper.client_entities[0],
+            EntityTrigger(client_entity),
+            client_entity
+        )]
+    );
+}
+
+/// Test sending a message to multiple clients
+#[test]
+fn test_send_multi_messages() {
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::with_netcode_clients(2));
+
+    stepper.client_apps[0].init_resource::<Buffer<StringMessage>>();
+    stepper.client_apps[0].add_systems(Update, count_messages_observer::<StringMessage>);
+
+    stepper.client_apps[1].init_resource::<Buffer<StringMessage>>();
+    stepper.client_apps[1].add_systems(Update, count_messages_observer::<StringMessage>);
+
+    info!("Sending messages from server to client");
+    let send_message = StringMessage("World".to_string());
+    let message = send_message.clone();
+    let client_of_0 = stepper.client_of_entities[0];
+    let client_of_1 = stepper.client_of_entities[1];
+
+    let system_id = stepper
+        .server_app
+        .register_system(move |mut sender: MultiMessageSender| {
+            sender
+                .send::<_, Channel1>(&message, unsafe {
+                    UniqueEntityArray::from_array_unchecked([client_of_0, client_of_1])
+                })
+                .ok();
+        });
+    stepper.server_app.world_mut().run_system(system_id);
+    stepper.frame_step(2);
+
+    let received_messages = stepper.client_apps[0]
+        .world()
+        .resource::<Buffer<StringMessage>>();
+    assert!(
+        &received_messages
+            .0
+            .contains(&(stepper.client_entities[0], send_message.clone()))
+    );
+    let received_messages = stepper.client_apps[1]
+        .world()
+        .resource::<Buffer<StringMessage>>();
+    assert!(
+        &received_messages
+            .0
+            .contains(&(stepper.client_entities[1], send_message.clone()))
+    );
+}
+
+/// Test sending a message to multiple clients with NetworkTarget
+#[test]
+fn test_send_multi_messages_with_target() {
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::with_netcode_clients(2));
+
+    stepper.client_apps[0].init_resource::<Buffer<StringMessage>>();
+    stepper.client_apps[0].add_systems(Update, count_messages_observer::<StringMessage>);
+    stepper.client_apps[1].init_resource::<Buffer<StringMessage>>();
+    stepper.client_apps[1].add_systems(Update, count_messages_observer::<StringMessage>);
+
+    info!("Sending messages from server to client");
+    let send_message = StringMessage("World".to_string());
+    let message = send_message.clone();
+    let client_0_id = stepper.client_of(0).get::<RemoteId>().unwrap().0;
+    let system_id = stepper.server_app.register_system(
+        move |mut sender: ServerMultiMessageSender,
+              server: Single<&Endpoint>,
+              mut sent_all: Local<bool>| {
+            let target = if *sent_all {
+                NetworkTarget::Single(client_0_id)
+            } else {
+                NetworkTarget::All
+            };
+            sender
+                .send::<_, Channel1>(&message, server.into_inner(), &target)
+                .ok();
+            *sent_all = true;
+        },
+    );
+    stepper.server_app.world_mut().run_system(system_id);
+    stepper.frame_step(2);
+
+    let received_messages = stepper.client_apps[0]
+        .world()
+        .resource::<Buffer<StringMessage>>();
+    assert!(
+        &received_messages
+            .0
+            .contains(&(stepper.client_entities[0], send_message.clone()))
+    );
+    let received_messages = stepper.client_apps[1]
+        .world()
+        .resource::<Buffer<StringMessage>>();
+    assert!(
+        &received_messages
+            .0
+            .contains(&(stepper.client_entities[1], send_message.clone()))
+    );
+
+    stepper.client_apps[0]
+        .world_mut()
+        .resource_mut::<Buffer<StringMessage>>()
+        .0
+        .clear();
+    stepper.client_apps[1]
+        .world_mut()
+        .resource_mut::<Buffer<StringMessage>>()
+        .0
+        .clear();
+
+    // Run the same system again with a narrower target. The reusable target set must not retain
+    // the second client from the previous broadcast.
+    stepper.server_app.world_mut().run_system(system_id);
+    stepper.frame_step(2);
+
+    let received_messages = stepper.client_apps[0]
+        .world()
+        .resource::<Buffer<StringMessage>>();
+    assert!(
+        received_messages
+            .0
+            .contains(&(stepper.client_entities[0], send_message))
+    );
+    assert!(
+        stepper.client_apps[1]
+            .world()
+            .resource::<Buffer<StringMessage>>()
+            .0
+            .is_empty()
+    );
+}

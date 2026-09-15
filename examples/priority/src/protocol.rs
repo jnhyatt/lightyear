@@ -1,84 +1,21 @@
-use std::ops::Mul;
-
 use bevy::prelude::*;
-use derive_more::{Add, Mul};
-use leafwing_input_manager::action_state::ActionState;
-use leafwing_input_manager::input_map::InputMap;
-use leafwing_input_manager::prelude::Actionlike;
-use leafwing_input_manager::InputManagerBundle;
-use serde::{Deserialize, Serialize};
-use tracing::info;
-
-use lightyear::client::components::ComponentSyncMode;
-use lightyear::prelude::server::*;
+use lightyear::prelude::input::bei::*;
 use lightyear::prelude::*;
-
-// Player
-#[derive(Bundle)]
-pub(crate) struct PlayerBundle {
-    id: PlayerId,
-    position: Position,
-    color: PlayerColor,
-    replicate: Replicate,
-    action_state: ActionState<Inputs>,
-}
-
-impl PlayerBundle {
-    pub(crate) fn new(id: ClientId, position: Vec2) -> Self {
-        // Generate pseudo random color from client id.
-        let h = (((id.to_bits().wrapping_mul(30)) % 360) as f32) / 360.0;
-        let s = 0.8;
-        let l = 0.5;
-        let color = Color::hsl(h, s, l);
-
-        let replicate = Replicate {
-            sync: SyncTarget {
-                prediction: NetworkTarget::Single(id),
-                interpolation: NetworkTarget::AllExceptSingle(id),
-            },
-            controlled_by: ControlledBy {
-                target: NetworkTarget::Single(id),
-            },
-            ..default()
-        };
-        Self {
-            id: PlayerId(id),
-            position: Position(position),
-            color: PlayerColor(color),
-            replicate,
-            action_state: ActionState::default(),
-        }
-    }
-    pub(crate) fn get_input_map() -> InputMap<Inputs> {
-        InputMap::new([
-            (Inputs::Right, KeyCode::ArrowRight),
-            (Inputs::Right, KeyCode::KeyD),
-            (Inputs::Left, KeyCode::ArrowLeft),
-            (Inputs::Left, KeyCode::KeyA),
-            (Inputs::Up, KeyCode::ArrowUp),
-            (Inputs::Up, KeyCode::KeyW),
-            (Inputs::Down, KeyCode::ArrowDown),
-            (Inputs::Down, KeyCode::KeyS),
-            (Inputs::Delete, KeyCode::Backspace),
-            (Inputs::Spawn, KeyCode::Space),
-            (Inputs::Message, KeyCode::KeyM),
-        ])
-    }
-}
+use serde::{Deserialize, Serialize};
 
 // Components
 
 #[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct PlayerId(pub ClientId);
+pub struct PlayerId(pub PeerId);
 
-#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Deref, DerefMut, Add, Mul)]
+#[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Deref, DerefMut)]
 pub struct Position(pub(crate) Vec2);
 
-impl Mul<f32> for &Position {
-    type Output = Position;
-
-    fn mul(self, rhs: f32) -> Self::Output {
-        Position(self.0 * rhs)
+impl Ease for Position {
+    fn interpolating_curve_unbounded(start: Self, end: Self) -> impl Curve<Self> {
+        FunctionCurve::new(Interval::UNIT, move |t| {
+            Position(Vec2::lerp(start.0, end.0, t))
+        })
     }
 }
 
@@ -97,7 +34,6 @@ pub enum Shape {
 
 // Channels
 
-#[derive(Channel)]
 pub struct Channel1;
 
 // Messages
@@ -106,50 +42,32 @@ pub struct Channel1;
 pub struct Message1(pub usize);
 
 // Inputs
+#[derive(Component, Serialize, Deserialize, Reflect, Clone, Debug, PartialEq)]
+pub struct Player;
 
-#[derive(
-    Serialize, Deserialize, Debug, Default, PartialEq, Eq, Hash, Reflect, Clone, Copy, Actionlike,
-)]
-pub enum Inputs {
-    Up,
-    Down,
-    Left,
-    Right,
-    Delete,
-    Spawn,
-    Message,
-    #[default]
-    None,
-}
+#[derive(Debug, InputAction)]
+#[action_output(Vec2)]
+pub struct Movement;
 
 // Protocol
 pub(crate) struct ProtocolPlugin;
 
 impl Plugin for ProtocolPlugin {
     fn build(&self, app: &mut App) {
-        // messages
-        app.add_message::<Message1>(ChannelDirection::Bidirectional);
         // inputs
-        app.add_plugins(LeafwingInputPlugin::<Inputs>::default());
+        app.add_plugins(InputPlugin::<Player>::default());
+        app.register_input_action::<Movement>();
+
         // components
-        app.register_component::<PlayerId>(ChannelDirection::ServerToClient)
-            .add_prediction(ComponentSyncMode::Once)
-            .add_interpolation(ComponentSyncMode::Once);
+        app.component::<PlayerId>().replicate();
 
-        app.register_component::<Position>(ChannelDirection::ServerToClient)
-            .add_prediction(ComponentSyncMode::Full)
-            .add_interpolation(ComponentSyncMode::Full)
-            .add_linear_interpolation_fn();
+        app.component::<Position>()
+            .replicate()
+            .predict()
+            .add_linear_interpolation();
 
-        app.register_component::<PlayerColor>(ChannelDirection::ServerToClient)
-            .add_prediction(ComponentSyncMode::Once)
-            .add_interpolation(ComponentSyncMode::Once);
+        app.component::<PlayerColor>().replicate();
 
-        app.register_component::<Shape>(ChannelDirection::ServerToClient);
-        // channels
-        app.add_channel::<Channel1>(ChannelSettings {
-            mode: ChannelMode::OrderedReliable(ReliableSettings::default()),
-            ..default()
-        });
+        app.component::<Shape>().replicate();
     }
 }

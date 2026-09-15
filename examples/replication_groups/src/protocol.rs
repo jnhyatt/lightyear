@@ -1,101 +1,40 @@
-use std::collections::VecDeque;
-use std::ops::Mul;
-
+extern crate alloc;
+use alloc::collections::VecDeque;
 use bevy::app::{App, Plugin};
 use bevy::ecs::entity::MapEntities;
-use bevy::prelude::{
-    default, Bundle, Color, Component, Deref, DerefMut, Entity, EntityMapper, Reflect, Vec2,
-};
-use derive_more::{Add, Mul};
-use serde::{Deserialize, Serialize};
-use tracing::{debug, info, trace};
-
-use lightyear::client::components::ComponentSyncMode;
-use lightyear::prelude::client::LerpFn;
-use lightyear::prelude::server::*;
+use bevy::math::Curve;
+use bevy::prelude::*;
+use core::ops::{Add, Mul};
+use lightyear::input::native::plugin::InputPlugin;
 use lightyear::prelude::*;
-use lightyear::shared::replication::components::ReplicationGroup;
-
-// Player
-#[derive(Bundle)]
-pub(crate) struct PlayerBundle {
-    id: PlayerId,
-    position: PlayerPosition,
-    color: PlayerColor,
-    replicate: Replicate,
-}
-
-// Tail
-#[derive(Bundle)]
-pub(crate) struct TailBundle {
-    parent: PlayerParent,
-    points: TailPoints,
-    length: TailLength,
-    replicate: Replicate,
-}
-
-impl PlayerBundle {
-    pub(crate) fn new(id: ClientId, position: Vec2) -> Self {
-        // Generate pseudo random color from client id.
-        let h = (((id.to_bits().wrapping_mul(30)) % 360) as f32) / 360.0;
-        let s = 0.8;
-        let l = 0.5;
-        let color = Color::hsl(h, s, l);
-        Self {
-            id: PlayerId(id),
-            position: PlayerPosition(position),
-            color: PlayerColor(color),
-            replicate: Replicate {
-                sync: SyncTarget {
-                    prediction: NetworkTarget::Single(id),
-                    interpolation: NetworkTarget::AllExceptSingle(id),
-                },
-                controlled_by: ControlledBy {
-                    target: NetworkTarget::Single(id),
-                },
-                // the default is: the replication group id is a u64 value generated from the entity (`entity.to_bits()`)
-                group: ReplicationGroup::default(),
-                ..default()
-            },
-        }
-    }
-}
-
-impl TailBundle {
-    pub(crate) fn new(id: ClientId, parent: Entity, parent_position: Vec2, length: f32) -> Self {
-        let default_direction = Direction::default();
-        let tail = default_direction.get_tail(parent_position, length);
-        let mut points = VecDeque::new();
-        points.push_front((tail, default_direction));
-        Self {
-            parent: PlayerParent(parent),
-            points: TailPoints(points),
-            length: TailLength(length),
-            replicate: Replicate {
-                sync: SyncTarget {
-                    prediction: NetworkTarget::Single(id),
-                    interpolation: NetworkTarget::AllExceptSingle(id),
-                },
-                controlled_by: ControlledBy {
-                    target: NetworkTarget::Single(id),
-                },
-                // replicate this entity within the same replication group as the parent
-                group: ReplicationGroup::default().set_id(parent.to_bits()),
-                ..default()
-            },
-        }
-    }
-}
+use serde::{Deserialize, Serialize};
+use tracing::trace;
 
 // Components
 
 #[derive(Component, Serialize, Deserialize, Clone, Debug, PartialEq, Reflect)]
-pub struct PlayerId(ClientId);
+pub struct PlayerId(pub PeerId);
 
 #[derive(
-    Component, Serialize, Deserialize, Clone, Debug, PartialEq, Deref, DerefMut, Add, Reflect,
+    Component, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Deref, DerefMut, Reflect,
 )]
 pub struct PlayerPosition(pub(crate) Vec2);
+
+impl Ease for PlayerPosition {
+    fn interpolating_curve_unbounded(start: Self, end: Self) -> impl Curve<Self> {
+        FunctionCurve::new(Interval::UNIT, move |t| {
+            PlayerPosition(Vec2::lerp(start.0, end.0, t))
+        })
+    }
+}
+
+impl Add for PlayerPosition {
+    type Output = PlayerPosition;
+    #[inline]
+    fn add(self, rhs: PlayerPosition) -> PlayerPosition {
+        PlayerPosition(self.0.add(rhs.0))
+    }
+}
 
 impl Mul<f32> for &PlayerPosition {
     type Output = PlayerPosition;
@@ -149,13 +88,13 @@ impl PlayerPosition {
     }
 }
 
-#[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq)]
+#[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq, Reflect)]
 pub struct PlayerColor(pub(crate) Color);
 
-#[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq)]
+#[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq, Reflect)]
 pub struct TailLength(pub(crate) f32);
 
-#[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq)]
+#[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq, Reflect)]
 // tail inflection points, from front (point closest to the head) to back (tail end point)
 pub struct TailPoints(pub(crate) VecDeque<(Vec2, Direction)>);
 
@@ -209,37 +148,40 @@ impl TailPoints {
 // This can be done by calling `app.add_component_map_entities::<PlayerParent>()` in your protocol,
 // and deriving the `MapEntities` trait for the component.
 #[derive(Component, Deserialize, Serialize, Clone, Debug, PartialEq, Reflect)]
-pub struct PlayerParent(pub(crate) Entity);
+pub struct PlayerParent(#[entities] pub(crate) Entity);
 
 impl MapEntities for PlayerParent {
     fn map_entities<M: EntityMapper>(&mut self, entity_mapper: &mut M) {
-        self.0 = entity_mapper.map_entity(self.0);
+        self.0 = entity_mapper.get_mapped(self.0);
     }
 }
 
-// Channels
-
-#[derive(Channel)]
-pub struct Channel1;
-
-// Messages
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Message1(pub usize);
-
 // Inputs
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Default)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy, Reflect)]
 // To simplify, we only allow one direction at a time
 pub enum Direction {
-    #[default]
     Up,
     Down,
     Left,
     Right,
 }
 
+impl MapEntities for Direction {
+    fn map_entities<M: EntityMapper>(&mut self, entity_mapper: &mut M) {}
+}
+
 impl Direction {
+    pub fn is_opposite(self, other: Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Up, Self::Down)
+                | (Self::Down, Self::Up)
+                | (Self::Left, Self::Right)
+                | (Self::Right, Self::Left)
+        )
+    }
+
     // Get the direction from `from` to `to` (doesn't handle diagonals)
     pub fn from_points(from: Vec2, to: Vec2) -> Option<Self> {
         if from.x != to.x && from.y != to.y {
@@ -258,7 +200,7 @@ impl Direction {
         if from.x < to.x {
             return Some(Self::Right);
         }
-        return None;
+        None
     }
 
     // Get the position of the point that would become `head` if we applied `length` * `self`
@@ -272,15 +214,17 @@ impl Direction {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Clone, Reflect)]
 pub enum Inputs {
     Direction(Direction),
     Delete,
     Spawn,
-    // NOTE: the server MUST be able to distinguish between an input saying "the user is not doing any actions" and
-    // "we haven't received the input for this tick", which means that the client must send inputs every tick
-    // even if the user is not doing anything.
-    None,
+    #[default]
+    Empty,
+}
+
+impl MapEntities for Inputs {
+    fn map_entities<M: EntityMapper>(&mut self, entity_mapper: &mut M) {}
 }
 
 // Protocol
@@ -288,48 +232,28 @@ pub(crate) struct ProtocolPlugin;
 
 impl Plugin for ProtocolPlugin {
     fn build(&self, app: &mut App) {
-        // messages
-        app.add_message::<Message1>(ChannelDirection::Bidirectional);
         // inputs
         app.add_plugins(InputPlugin::<Inputs>::default());
         // components
-        app.register_component::<PlayerId>(ChannelDirection::ServerToClient)
-            .add_prediction(ComponentSyncMode::Once)
-            .add_interpolation(ComponentSyncMode::Once);
+        app.component::<Name>().replicate();
+        app.component::<PlayerId>().replicate();
 
-        app.register_component::<PlayerPosition>(ChannelDirection::ServerToClient)
-            .add_prediction(ComponentSyncMode::Full)
-            // NOTE: notice that we use custom interpolation here, this means that we don't run
-            //  the interpolation function for this component, so we need to implement our own interpolation system
-            //  (we do this because our interpolation system queries multiple components at once)
-            .add_custom_interpolation(ComponentSyncMode::Full)
-            // we still register an interpolation function which will be used for visual interpolation
-            .add_linear_interpolation_fn();
+        app.component::<PlayerPosition>().replicate().predict();
+        app.interpolate_with::<PlayerPosition>(
+            InterpolationFns::history_only().linear_interpolate(),
+        );
 
-        app.register_component::<PlayerColor>(ChannelDirection::ServerToClient)
-            .add_prediction(ComponentSyncMode::Once)
-            .add_interpolation(ComponentSyncMode::Once);
+        app.component::<PlayerColor>().replicate();
 
-        app.register_component::<TailPoints>(ChannelDirection::ServerToClient)
-            .add_prediction(ComponentSyncMode::Full)
-            // NOTE: notice that we use custom interpolation here, this means that we don't run
-            //  the interpolation function for this component, so we need to implement our own interpolation system
-            //  (we do this because our interpolation system queries multiple components at once)
-            .add_custom_interpolation(ComponentSyncMode::Full);
-        // we do not register an interpolation function because we will use a custom interpolation system
+        app.component::<TailPoints>().replicate().predict();
+        // TailPoints also participates in the custom network interpolation
+        // system, so Lightyear only owns its delayed history.
+        app.interpolate_filtered_with::<TailPoints, With<Interpolated>>(
+            InterpolationFns::history_only(),
+        );
 
-        app.register_component::<TailLength>(ChannelDirection::ServerToClient)
-            .add_prediction(ComponentSyncMode::Once)
-            .add_interpolation(ComponentSyncMode::Once);
+        app.component::<TailLength>().replicate();
 
-        app.register_component::<PlayerParent>(ChannelDirection::ServerToClient)
-            .add_map_entities()
-            .add_prediction(ComponentSyncMode::Once)
-            .add_interpolation(ComponentSyncMode::Once);
-        // channels
-        app.add_channel::<Channel1>(ChannelSettings {
-            mode: ChannelMode::OrderedReliable(ReliableSettings::default()),
-            ..default()
-        });
+        app.component::<PlayerParent>().replicate();
     }
 }

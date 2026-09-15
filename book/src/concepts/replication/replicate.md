@@ -1,36 +1,57 @@
 # Replication
 
-You can use the `Replicate` bundle to initiate replicating an entity from the local `World` to the remote `World`.
+You add the `Replicate` component to an entity to replicate it from the local `World` to the remote `World`.
 
-It is composed of multiple smaller components that each control an aspect of replication:
-- `ReplicationTarget` to decide who to replicate to
-- `VisibilityMode` to enable interest management
-- `ControlledBy` so the server can track which entity is owned by each client
-- `ReplicationGroup` to know which entity updates should be sent together in the same message
-- `ReplicateHierarchy` to control if the children of an entity should also be replicated
-- `DisabledComponent<C>` to disable replication for a specific component
-- `ReplicateOnceComponent<C>` to specify that some components should not replicate updates, only inserts/removals
-- `OverrideTargetComponent<C>` to override the replication target for a specific component
+```rust,ignore
+commands.spawn((
+    PlayerBundle::new(client_id, Vec2::ZERO),
+    Replicate::to_clients(NetworkTarget::All),
+));
+```
 
-By default, every component in the entity that is part of the `ComponentRegistry` will be replicated. Any changes in
-those components will be replicated.
-However the entity state will always be 'consistent': the remote entity will always contain the exact same combination
-of components as the local entity, even if it's a bit delayed.
+`Replicate` decides who the entity goes to. There are two sibling components:
+- `PredictionTarget` controls which clients run client-side prediction for the entity (they get a `Predicted` copy)
+- `InterpolationTarget` controls which clients interpolate the entity (they get an `Interpolated` copy)
 
-You can remove the `ReplicationTarget` component to pause the replication. This can be useful when you want to despawn the
-entity on the server without replicating the despawn.
+By default, every component on the entity that was registered with `app.component::<C>().replicate()` gets replicated, and every change gets sent.
+The remote copy always converges to a consistent past state of the local entity: same set of components, same values, just delayed.
+
+A few more pieces you can attach to a replicated entity:
+- `ControlledBy` so the server can track which client owns the entity (the owning client gets a `Controlled` marker on its copy, which is how it knows where to put its `InputMarker`)
+- `ReplicateLike` / `DisableReplicateHierarchy` to control whether children of the entity are replicated similarly to the parent
+- Per-component behavior is chosen at registration time instead: `replicate_once()` for insert-only components, `replicate_filtered::<With<RigidBody>>()` to only replicate on matching entities, `replicate_with_priority(n)` for bandwidth management
+
+Adding `Replicate` also adds the required `Replicating` marker. You can remove `Replicating` to pause replication
+without changing the target. This can be useful when you want to despawn the entity on the server without replicating the despawn.
 (e.g. an entity can be despawned immediately on the server, but needs to remain alive on the client to play a dying
-animation)
+animation). Reinsert `Replicating` to resume replication.
 
 You can find some of the other usages in the [advanced_replication](../advanced_replication/title.md) section.
 
 
 ### Replicating resources
 
-You can also replicate bevy `Resources`. This is useful when you want to update a `Resource` on the server and keep synced
-copies on the client. This only works for `Resources` that also implement `Clone`, and should be limited to resources which are cheap to clone.
+You can also replicate bevy `Resource`s. This is useful when you want to update a `Resource` on the server and keep synced
+copies on the client. In Bevy 0.19, resources are components stored on Bevy's resource entities, and Lightyear relies on
+Replicon's resource replication API for this.
 
-- Then, to replicate a `Resource`, you can use the `commands.replicate_resource::<R>(replicate)` method. You will need to provide
-an instance of the `Replicate` struct to specify how the replication should be done (e.g. to which clients should the resource
-be replicated). To stop replicating a `Resource`, you can use the `commands.stop_replicate_resource::<R>()` method. Note that
-this won't delete the resource from the client, but it will stop updating it.
+To replicate a `Resource`:
+- Define your resource and register it with Replicon on both peers:
+    ```rust
+    use bevy_replicon::prelude::AppRuleExt;
+
+    #[derive(Resource, Serialize, Deserialize)]
+    pub struct MyResource(pub f32);
+
+    pub fn plugin(app: &mut App) {
+        app.replicate_resource::<MyResource>();
+    }
+    ```
+- Insert the resource on the server:
+    ```rust
+    commands.insert_resource(MyResource(1.0));
+    ```
+
+Replicon also provides `replicate_resource_once`, `replicate_resource_as`, and diff-based variants. If a client creates a
+local copy of the same resource before the server replicates it, use Replicon's resource-entity mapping support to avoid
+spawning a duplicate resource entity.

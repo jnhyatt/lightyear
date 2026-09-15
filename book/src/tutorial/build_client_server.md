@@ -1,142 +1,122 @@
 # Setting up the client and server
 
+The client and server will both be bevy Entities to which you can add components to customize their networking behaviour.
+Here are some of the common components:
+- [`Link`](https://docs.rs/lightyear/latest/lightyear/link/struct.Link.html) represents an IO link between a local peer and a remote peer that can be used to send and receive raw bytes
+- [`Transport`](https://docs.rs/lightyear/latest/lightyear/prelude/struct.Transport.html) adds the capability of setting up various Channels that each provide different reliability/ordering guarantees for a group of bytes
+- [`MessageManager`](https://docs.rs/lightyear/latest/lightyear/prelude/struct.MessageManager.html), [`MessageSender<M>`](https://docs.rs/lightyear/latest/lightyear/prelude/struct.MessageSender.html), [`MessageReceiver<M>`](https://docs.rs/lightyear/latest/lightyear/prelude/struct.MessageReceiver.html) are used to send and receive messages over the network.
+  A message is any rust type that can be serialized/deserialize into raw bytes.
+- [`ReplicationSender`](https://docs.rs/lightyear/latest/lightyear/prelude/struct.ReplicationSender.html) is added to a link entity to enable sending replicated entities and components through that connection, and [`ReplicationReceiver`](https://docs.rs/lightyear/latest/lightyear/prelude/struct.ReplicationReceiver.html) is added to receive them.
+
+## Link
+
+The [`Link`] component is the primary component that represents a connection between two peers. Every network connection is represented by a link. On the server side, you have a [`Server`](https://docs.rs/lightyear/latest/lightyear/link/prelude/struct.Server.html) 
+component which spawns a new entity with a [`Link`] component every time a new client connects to it. The [`LinkOf`](https://docs.rs/lightyear/latest/lightyear/link/prelude/struct.LinkOf.html) relationship component is added on these entities to help you identify the 
+[`Server`] that they are connected to.
+
+The link is agnostic to the actual io layer, you will have to pair it with an actual io component (`UdpIo`, `WebTransportIo`, etc.) to start sending and receiving bytes.
+
+## Connection
+
+Lightyear makes a distinction between a [`Link`] and a `Connection`.
+A `Link` is a low-level component that represents a raw IO link, which can be used to send and receive bytes.
+A `Connection` is a link that has a long-lived identifiers attached to them. The `LocalId` and `RemoteId` components are used to store the `PeerId` of the local and remote peers, respectively.
+The `PeerId` is a unique identifier for a peer in the network, which can be used to identify the peer across multiple connections. (a client could get disconnected and reconnect with a different 
+[`Link`],
+but still have the same `PeerId`).
+
+The lifecycle of a connection is controlled by several sets of components.
+
+You can trigger [`Connect`] to start the connection, and [`Disconnect`] to stop it.
+
+The [`Disconnected`], [`Connecting`], [`Connected`] components represent the current state of the connection.
+
+On the server, [`Start`] and [`Stop`] components are used to control the server's listening state.
+The [`Stopped`], [`Starting`], [`Started`] components represent the current state of the connection.
+
+While a client is disconnected, you can update its configuration (`ReplicationSender`, `MessageManager`, etc.), it will be applied on the next connection attempt.
+
+
 ## Client
 
-A client is simply a bevy plugin: [ClientPlugin](https://docs.rs/lightyear/latest/lightyear/client/plugin/struct.ClientPlugin.html)
-
-You create it by providing a [`ClientConfig`](https://docs.rs/lightyear/latest/lightyear/client/config/struct.ClientConfig.html) struct.
-
-You can see how it is defined in the example [here](https://github.com/cBournhonesque/lightyear/blob/main/examples/simple_box/src/main.rs#L175).
-
-### Shared Config
-
-Some parts of the configuration must be shared between the server and the client to work correctly, so we define them in a separate function that can be re-used for both:
-```rust
-pub fn shared_config(mode: Mode) -> SharedConfig {
-    SharedConfig {
-        /// How often the client will send packets to the server (by default it is every frame).
-        /// Currently, the client only works if it sends packets every frame, for proper input handling.
-        client_send_interval: Duration::default(),
-        /// How often the server will send packets to clients? You can reduce this to save bandwidth.
-        server_send_interval: Duration::from_millis(40),
-        /// The tick rate that will be used for the FixedUpdate schedule
-        tick: TickConfig {
-            tick_duration: Duration::from_secs_f64(1.0 / 64.0),
-        },
-        /// Here we make the `Mode` an argument so that we can run `lightyear` either in `Separate` mode (distinct client and server apps)
-        /// or in `HostServer` mode (the server also acts as a client).
-        mode,
-    }
-}
-```
-
-### ClientConfig
-
-The [ClientConfig](https://docs.rs/lightyear/latest/lightyear/client/config/struct.ClientConfig.html) struct lets us configure the client. There are a lot of parameters that can be configured,
-but for this demo we will mostly use the defaults.
-
+A client is simply an entity with a [`Link`] to which the [`Client`] marker component is added.
+The marker component is used in conjunction with the protocol to customize the behaviour of the link entity.
+For example if a message is added to the protocol with
 ```rust,noplayground
-  let client_config = client::ClientConfig {
-      shared: shared_config(Mode::Separate),
-      net: net_config,
-      ..default()
-  };
-  let client_plugin = client::ClientPlugin::new(client_config);
+app.register_message::<Message1>()
+  .add_direction(NetworkDirection::ServerToClient);
 ```
+then a `MessageReceiver<Message1>` component will automatically be added to any `Client` entity.
 
-The [NetConfig](https://docs.rs/lightyear/latest/lightyear/prelude/client/enum.NetConfig.html) doesn't have any Default value and needs to be provided; it defines how (i.e. what transport layer) the client will connect to the server.
-There are multiple options available, but for this demo we will use the `Netcode` option.
-[netcode](https://github.com/mas-bandwidth/netcode/blob/main/STANDARD.md) is a standard to establish a connection between two hosts, and we can use any io layer (UDP, WebSocket, WebTransport, etc.) to send the actual bytes.
+You can also just add the [`MessageReceiver<M>`] component directly to the client entity to receive messages of type `M` from the server.
 
-You will need to provide the [IoConfig](https://docs.rs/lightyear/latest/lightyear/transport/io/struct.IoConfig.html) which defines the transport layer (how the raw packets are sent),
-with the possibility of using a [LinkConditionerConfig](https://docs.rs/lightyear/latest/lightyear/prelude/struct.LinkConditionerConfig.html) to simulate network conditions.
-Here are the different possible transport options: [TransportConfig](https://docs.rs/lightyear/latest/lightyear/transport/io/enum.TransportConfig.html)
+Here is how you can set up a client in your app:
 
-
-```rust,noplayground
-/// You can add a link conditioner to simulate network conditions
-let link_conditioner = LinkConditionerConfig {
-    incoming_latency: Duration::from_millis(100),
-    incoming_jitter: Duration::from_millis(0),
-    incoming_loss: 0.00,
-};
-/// Here we use the `UdpSocket` transport layer, with the link conditioner
-let io_config = IoConfig::from_transport(TransportConfig::UdpSocket(addr))
-    .with_conditioner(link_conditioner);
-```
-
-With the `Netcode` option, we use a [ConnectToken](https://docs.rs/lightyear/latest/lightyear/connection/netcode/struct.ConnectToken.html) to secure the connection.
-Normally, a third-party server would generate the `ConnectToken` and send it securely to the client.
-
-For this demo, we will use the `Manual` option, which lets us manually build a `ConnectToken` on the client using a private key shared between the client and the server.
-
-```rust,noplayground
-let server_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), server_port);
+```rust,ignore
 let auth = Authentication::Manual {
-    // server's IP address
-    server_addr,
-    // ID to uniquely identify the client
-    client_id: client_id,
-    // private key shared between the client and server
-    private_key: KEY,
-    // PROTOCOL_ID identifies the version of the protocol
-    protocol_id: PROTOCOL_ID,
+    server_addr: SERVER_ADDR,
+    client_id: 0,
+    private_key: Key::default(),
+    protocol_id: 0,
 };
+let client = commands
+    .spawn((
+        Client,
+        LocalAddr(CLIENT_ADDR),
+        PeerAddr(SERVER_ADDR),
+        Link::default(),
+        ReplicationReceiver,
+        NetcodeClient::new(auth, NetcodeConfig::default())?,
+        UdpIo::default(),
+    ))
+    .id();
+commands.trigger_targets(Connect, client);
 ```
 
-Now we can build the complete `NetConfig`:
-```rust,noplayground
-let net_config = NetConfig::Netcode {
-    auth,
-    io: io_config,
-    ..default()
-};
-```
+Let's walk through this:
+- we add the [`Client`] marker component to the entity to identify it as a client.
+- we manually specify the [`LocalAddr`] and [`PeerAddr`] components to define the local and remote addresses of the link.
+- we add the [`Link`] component to the entity, which will be used to send and receive raw bytes over the network.
+- we add the [`ReplicationReceiver`] component to the entity, which will be used to receive replicated entities and components from the server.
+- every [`Link`] needs to use a connection layer; either Netcode or Steam. Here we will use Netcode. For testing purposes we will use the `Manual` authentication method, where we have to specify the 
+  server address and client ID.
+- finally we add the [`UdpIo`] component to the entity, which will be used to send and receive UDP packets over the network.
+
+Finally we trigger the [`Connect`] trigger to start the connection process.
+
+(The examples wrap this setup in `ExampleClient`/`ExampleServer` helpers in `examples/common`, but the components are the same ones you see here.)
 
 
 ## Server
 
-Building the server is very similar to building the client; we need to provide a `ServerConfig` struct.
-```rust,noplayground
-let server_config = server::ServerConfig {
-    shared: shared_config(Mode::Separate),
-    net: net_configs,
-    ..default()
-};
-let server_plugin = server::ServerPlugin::new(server_config);
+Similarly, a server is an entity to which the [`Server`] marker component is added.
+Everytime a new io link is established with a remote peer,
+a new entity will be spawned with the [`LinkOf`] component that will mark that [`Link`] as being a child of the endpoint owned by the [`Server`].
+
+```rust,ignore
+let server = commands
+    .spawn((
+        NetcodeServer::new(NetcodeConfig::default()),
+        LocalAddr(SERVER_ADDR),
+        UdpEndpoint::default(),
+        Server,
+    ))
+    .id();
+commands.trigger_targets(Start, server);
 ```
 
-The server can listen for client connections using multiple transports at the same time!
-You can do this by providing multiple [NetConfig](https://docs.rs/lightyear/latest/lightyear/prelude/server/enum.NetConfig.html) to the server.
+We need to add `NetcodeServer` because we need a connection layer. This will automatically insert the [`Server`] component.
+By default, it uses the server entity's [`LocalAddr`] to validate the private address list in
+incoming connection tokens. The transport updates [`LocalAddr`] after binding, so this also picks
+up an OS-assigned port when binding to port `0`.
+We also need to specify the [`LocalAddr`] component to define the local address of the server.
+The IO layer we choose is UDP, so we add the [`UdpEndpoint`] component to the entity, alongside the
+[`Server`] role marker that identifies it as an authoritative server rather than a P2P peer endpoint.
 
-The `simple_box` example generates the various `NetConfig`s by parsing the `settings.ron` file, but you can also just
-define them manually:
+For local development, wildcard and loopback addresses of the same family and port are considered
+equivalent, such as `0.0.0.0:5000` and `127.0.0.1:5000`. Address checking can be disabled for an
+addressless transport by setting `NetcodeConfig::server_addr_check` to `false`.
 
-```rust,noplaground
-let server_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), self.port);
-/// You need to provide the private key and protocol id when building the `NetcodeConfig`
-let netcode_config = NetcodeConfig::default()
-    .with_protocol_id(PROTOCOL_ID)
-    .with_key(KEY);
-/// You can also add a link conditioner to simulate network conditions for packets received by the server
-let link_conditioner = LinkConditionerConfig {
-    incoming_latency: Duration::from_millis(100),
-    incoming_jitter: Duration::from_millis(0),
-    incoming_loss: 0.00,
-};
-let net_config = NetConfig::Netcode {
-    config: netcode_config,
-    io: IoConfig::from_transport(TransportConfig::UdpSocket(server_addr))
-        .with_conditioner(link_conditioner),
-};
-let config = ServerConfig {
-    shared: shared_config().clone(),
-    /// Here we only provide a single net config, but you can provide multiple!
-    net: vec![net_config],
-    ..default()
-};
-/// Finally build the server plugin
-let server_plugin = server::ServerPlugin::new(server_config);
-```
+Finally we trigger the [`Start`] trigger so that the server can start listening for incoming connections.
 
 Next we will start adding systems to the client and server.

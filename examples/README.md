@@ -1,68 +1,65 @@
 # Examples
 
-This folder contains various examples that showcase various `lightyear` features.
-
+This folder contains various examples showcasing `lightyear` features.
 
 ## Easy
 
-- `simple_setup`: minimal example that just shows how to create the lightyear client and server plugins
-- `simple_box`: example that showcases how to send inputs from client to server, and how to add client-prediction and interpolation
+Start here:
+- `simple_setup`: minimal example that hows how to create a client and server and replicate an entity
+
+Then:
+- `simple_box`: example that showcases client/server prediction and interpolation, plus an optional deterministic input-only P2P mode
+- `bevy_enhanced_input`: example that shows how to integrate lightyear with the `bevy_enhanced_input` crate to handle inputs.
 
 ## Medium
 
+- `delta_compression`: example that shows how a component can be replicated with delta-compression enabled. Whenever the component value
+  changes, only the difference is sent over the network, instead of the full component value.
+- `network_visibility`: example that shows how to use network visibility to only replicate a subset of entities
+  to each player
 - `replication_groups`: example that shows how to replicate entities that refer to other entities
   (e.g. they have a component containing an `Entity` id). You need to use `ReplicationGroup` to ensure that the
   those entities are replicated in the same message
-- `interest_management`: example that shows how to use interest management to only replicate a subset of entities
-  to each player, via the `VisibilityManager` and the `RoomManager`
-- `client_replication`: example that shows how to replicate entities from the client to the server. (i.e. the client has authority)
 - `priority`: example that shows how to manage bandwidth by enabling priority accumulation. Messages will be sent in
   order of their priority.
 
 ## Advanced
 
-- `xpbd_physics`: example that shows how to replicate a physics simulation using xpbd.
+- `avian_2d`: example that shows how to replicate a 2D physics simulation using Avian.
   We also use the `leafwing` feature for a better way to manage inputs.
-- `spaceships`: more advanced version of `xpbd_physics` with player movement based on forces, fully server authoritative, predicted bullet spawning. 
-- `bullet_prespawn`: example that shows how to spawn player-objects on the Predicted timeline. This is useful
-  to avoid having to wait a full round-trip before the object is spawned.
+- `avian_3d`: example that shows clients controlling server-authoritative 3D objects simulated using Avian.
+- `fps`: example that shows how to spawn player-objects directly on the Predicted timeline, and how to use lag compensation to compute collisions between predicted and interpolated entities.
+- `timeline_switch`: example where players pick up physics blocks. Nearby free blocks are predicted, blocks carried by another player stay interpolated, showing how to move entities between timelines at runtime with `TimelineSwitch`.
 - `auth`: an example that shows how a client can get a `ConnectToken` to connect to a server
 - `lobby`: an example that shows how the network topology can be changed at runtime.
   Every client can potentially act as a host for the game (instead of the dedicated server).
 
 ## Running an example
 
-Each example runs in a similar way.
+- Run the server headlessly (the default): `cargo run -- server`
+- Run the server with a GUI: `cargo run -- --headless=false server`
+- Run client with id 1: `cargo run -- client -c 1`
 
-There are different 'modes' of operation:
+[//]: # (- Run the client and server in two separate bevy Apps: `cargo run` or `cargo run separate`)
+- Build and run the server without GUI support: `cargo run --no-default-features --features=server -- server`
+- Run the client and server in "HostClient" mode, where the client also acts as server (both are in the same App) : `cargo run -- host-client -c 0`
 
-- as a dedicated server with `cargo run -- server`
-- as a listen server with `cargo run -- client-and-server`. This will launch 2 independent bevy apps (client and server) in
-  separate threads.
-  They will communicate via channels (so with almost 0 latency)
-- as a listen server with `cargo run -- host-server`. This will launch a single bevy app, where the server will also act
-  as a client. Functionally, it is similar to the "listen-server" mode, but you have a single bevy `World` instead of
-  separate client and server `Worlds`s.
+You can control the behaviour of the example by changing the list of features. By default, all features are enabled (client, server, gui).
+For example you can run the server in headless mode (without gui) by running `cargo run --no-default-features --features=server,webtransport,netcode`.
 
-Then you can launch clients with the commands:
+To build all compatible examples, use `just build_examples features=client,server`. Add
+`headless=true` to omit the GUI from client/P2P builds, or `headless=false` to include it explicitly.
+Use `names=avian_3d` or a comma-separated list such as `names=avian_2d,avian_3d` to build only
+those example/demo packages.
 
-- `cargo run -- client -c 1` (`-c 1` overrides the client id, to use client id 1)
-- `cargo run -- client -c 2`
-
-You can modify the file `assets/settings.ron` to modify some networking settings.
+Larger interactive applications, including the projectiles networking test bed,
+live in [`demos/`](../demos/README.md).
 
 ### Testing in wasm with webtransport
 
-NOTE: I am using [trunk](https://trunkrs.dev/) to build and serve the wasm example.
+NOTE: I am using the [bevy cli](https://github.com/TheBevyFlock/bevy_cli) to build and serve the wasm example.
 
-To test the example in wasm, you can run the following commands: `trunk serve`
+To test the example in wasm, you can run the following commands: `bevy run web`
 
-You will need a valid SSL certificate to test the example in wasm using webtransport. You will need to run the following
-commands:
-
-- `sh examples/certificates/generate.sh` (to generate the temporary SSL certificates, they are only valid for 2 weeks)
-- `cargo run -- server` to start the server. The server will print out the certificate digest (something
-  like `1fd28860bd2010067cee636a64bcbb492142295b297fd8c480e604b70ce4d644`)
-- You then have to replace the certificate digest in the `assets/settings.ron` file with the one that the server printed
-  out.
-- then start the client wasm test with `trunk serve`
+The repo includes a pre-generated self-signed WebTransport certificate and digest, so you do not need to run the certificate generator for the usual local workflow while that certificate is valid. If it expires, or if you want to replace it, generate a new temporary self-signed certificate with:
+- `cargo run -p generate_certificate` (writes `certificates/cert.pem`, `certificates/key.pem`, and `certificates/digest.txt`; rebuild wasm clients after regenerating so they embed the new digest)

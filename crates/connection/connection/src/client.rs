@@ -1,0 +1,306 @@
+use crate::network_topology::NetworkingMetadata;
+use alloc::string::String;
+use bevy_app::{App, Plugin};
+use bevy_ecs::lifecycle::HookContext;
+use bevy_ecs::prelude::*;
+use bevy_ecs::query::QueryData;
+use bevy_ecs::world::DeferredWorld;
+use bevy_reflect::Reflect;
+use lightyear_core::id::RemoteId;
+use lightyear_link::LinkStart;
+use lightyear_link::prelude::{Server, UnlinkReason, Unlinked};
+#[allow(unused_imports)]
+use tracing::{info, trace};
+
+/// Errors related to the client connection
+#[derive(thiserror::Error, Debug)]
+pub enum ConnectionError {
+    #[error("io is not initialized")]
+    IoNotInitialized,
+    #[error("connection not found")]
+    NotFound,
+    #[error("client is not connected")]
+    NotConnected,
+}
+
+/// Marker component to identify this entity as a Client
+#[derive(Component, Default, Reflect)]
+pub struct Client;
+
+/// Trigger to connect the client
+#[derive(EntityEvent)]
+pub struct Connect {
+    pub entity: Entity,
+}
+
+impl From<Entity> for Connect {
+    fn from(entity: Entity) -> Self {
+        Self { entity }
+    }
+}
+
+/// Trigger to disconnect the client
+#[derive(EntityEvent)]
+pub struct Disconnect {
+    pub entity: Entity,
+}
+
+impl From<Entity> for Disconnect {
+    fn from(entity: Entity) -> Self {
+        Self { entity }
+    }
+}
+
+// TODO: it looks like in some cases, we want Connected.peer_id to return the local peer_id (when client connects to server)
+//  and in some cases we want it to return the remote peer_id (when server's ClientOf gets connected)
+//  We should decide on a rule.
+
+#[derive(Component, Debug, Reflect)]
+#[component(on_add = Connected::on_add)]
+pub struct Connected;
+
+impl Connected {
+    fn on_add(mut world: DeferredWorld, context: HookContext) {
+        let peer_id = world
+            .get::<RemoteId>(context.entity)
+            .unwrap_or_else(|| {
+                panic!(
+                    "A Connected entity ({:?}) must always have a RemoteId component",
+                    context.entity
+                )
+            })
+            .0;
+        world
+            .commands()
+            .entity(context.entity)
+            .remove::<(Connecting, Disconnected)>();
+        if let Some(mut metadata) = world.get_resource_mut::<NetworkingMetadata>() {
+            metadata.peer_map.insert(peer_id, context.entity);
+        }
+    }
+}
+
+// TODO: add automatic disconnection for entities that are Connecting for too long
+#[derive(Component, Default, Debug, Reflect)]
+#[component(on_add = Connecting::on_add)]
+pub struct Connecting;
+
+impl Connecting {
+    fn on_add(mut world: DeferredWorld, context: HookContext) {
+        world
+            .commands()
+            .entity(context.entity)
+            .remove::<(Connected, Disconnecting, Disconnected)>();
+    }
+}
+
+/// Why a [`Disconnected`] component was inserted on a connection entity.
+#[derive(Default, Debug, Clone, PartialEq, Eq, Reflect)]
+pub enum DisconnectedReason {
+    /// The connection has not been attempted yet, or no more specific reason is available.
+    #[default]
+    Unknown,
+    /// The underlying link was closed or failed.
+    LinkFailed(UnlinkReason),
+    /// The local user requested the disconnect, optionally with additional context.
+    UserRequested(Option<String>),
+    /// The remote peer disconnected, optionally with a reason.
+    ByPeer(Option<String>),
+    /// The connection transport or protocol encountered an error.
+    TransportError(String),
+}
+
+impl core::fmt::Display for DisconnectedReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unknown => f.write_str("Unknown"),
+            Self::LinkFailed(reason) => write!(f, "Link failed: {reason}"),
+            Self::UserRequested(Some(reason)) => write!(f, "User requested: {reason}"),
+            Self::UserRequested(None) => f.write_str("User requested"),
+            Self::ByPeer(Some(reason)) => write!(f, "Disconnected by peer: {reason}"),
+            Self::ByPeer(None) => f.write_str("Disconnected by peer"),
+            Self::TransportError(reason) => write!(f, "Transport error: {reason}"),
+        }
+    }
+}
+
+#[derive(Component, Default, Debug, Reflect)]
+#[component(on_add = Disconnected::on_add)]
+pub struct Disconnected {
+    /// Structured reason for the disconnection.
+    pub reason: DisconnectedReason,
+}
+
+impl Disconnected {
+    fn on_add(mut world: DeferredWorld, context: HookContext) {
+        if let Some(peer_id) = world.get::<RemoteId>(context.entity).map(|c| c.0) {
+            let mut metadata = world.resource_mut::<NetworkingMetadata>();
+            // An old connection can finish disconnecting after its replacement is connected.
+            if metadata.peer_map.get(&peer_id) == Some(&context.entity) {
+                metadata.peer_map.remove(&peer_id);
+            }
+        }
+        world
+            .commands()
+            .entity(context.entity)
+            .remove::<(Connecting, Disconnecting, Connected)>();
+    }
+}
+
+#[derive(Component, Default, Debug, Reflect)]
+#[component(on_add = Disconnecting::on_add)]
+pub struct Disconnecting;
+
+impl Disconnecting {
+    fn on_add(mut world: DeferredWorld, context: HookContext) {
+        world
+            .commands()
+            .entity(context.entity)
+            .remove::<(Connected, Connecting, Disconnected)>();
+    }
+}
+
+/// Query view over a connection entity's lifecycle marker components.
+///
+/// Unlike the old cached state on [`Client`], this can be queried on both
+/// client entities and server-side `ClientOf` / `LinkOf` entities.
+#[derive(QueryData)]
+pub struct ClientState {
+    pub connected: Has<Connected>,
+    pub connecting: Has<Connecting>,
+    pub disconnecting: Has<Disconnecting>,
+    pub disconnected: Has<Disconnected>,
+}
+
+impl ClientStateItem<'_, '_> {
+    pub fn is_connected(&self) -> bool {
+        self.connected
+    }
+
+    pub fn is_connecting(&self) -> bool {
+        self.connecting
+    }
+
+    pub fn is_disconnecting(&self) -> bool {
+        self.disconnecting
+    }
+
+    pub fn is_disconnected(&self) -> bool {
+        self.disconnected || !(self.connected || self.connecting || self.disconnecting)
+    }
+}
+
+pub struct ConnectionPlugin;
+
+impl ConnectionPlugin {
+    /// When the client request to connect, we also try to establish the link
+    fn connect(connect: On<Connect>, mut commands: Commands) {
+        trace!("Triggering LinkStart because Connect was triggered");
+        commands.trigger(LinkStart {
+            entity: connect.entity,
+        });
+    }
+
+    /// If the underlying link fails, we also disconnect the client
+    fn disconnect_if_link_fails(
+        trigger: On<Add, Unlinked>,
+        query: Query<&Unlinked, (Without<Disconnected>, Without<Server>)>,
+        mut commands: Commands,
+    ) {
+        if let Ok(unlinked) = query.get(trigger.entity) {
+            trace!(
+                entity = ?trigger.entity,
+                "Adding Disconnected because the link got Unlinked (reason: {:?})",
+                unlinked.reason
+            );
+            commands.entity(trigger.entity).insert(Disconnected {
+                reason: DisconnectedReason::LinkFailed(unlinked.reason.clone()),
+            });
+        }
+    }
+}
+
+impl Plugin for ConnectionPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<NetworkingMetadata>();
+        app.add_observer(Self::connect);
+        app.add_observer(Self::disconnect_if_link_fails);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client_of::ClientOf;
+    use bevy_ecs::world::World;
+    use lightyear_core::id::PeerId;
+
+    #[test]
+    fn stale_disconnect_preserves_replacement_peer_lookup() {
+        let mut world = World::new();
+        world.init_resource::<NetworkingMetadata>();
+        let peer = PeerId::Local(1);
+        let old = world.spawn((RemoteId(peer), Connected)).id();
+        let replacement = world.spawn((RemoteId(peer), Connected)).id();
+
+        world.entity_mut(old).insert(Disconnected::default());
+        assert_eq!(
+            world.resource::<NetworkingMetadata>().peer_map.get(&peer),
+            Some(&replacement)
+        );
+        assert!(world.get::<Connected>(replacement).is_some());
+
+        world
+            .entity_mut(replacement)
+            .insert(Disconnected::default());
+        assert!(
+            !world
+                .resource::<NetworkingMetadata>()
+                .peer_map
+                .contains_key(&peer)
+        );
+    }
+
+    #[test]
+    fn client_state_query_reads_lifecycle_markers() {
+        let mut world = World::new();
+        let client = world.spawn(Client).id();
+        let client_of = world.spawn((ClientOf, Connecting)).id();
+        let connected_client_of = world
+            .spawn((ClientOf, RemoteId(PeerId::Local(0)), Connected))
+            .id();
+
+        let mut query = world.query::<ClientState>();
+
+        let state = query.get(&world, client).unwrap();
+        assert!(state.is_disconnected());
+        assert!(!state.is_connecting());
+
+        let state = query.get(&world, client_of).unwrap();
+        assert!(state.is_connecting());
+        assert!(!state.is_disconnected());
+
+        let state = query.get(&world, connected_client_of).unwrap();
+        assert!(state.is_connected());
+        assert!(!state.is_disconnected());
+    }
+
+    #[test]
+    fn link_failure_preserves_structured_reason() {
+        let mut app = App::new();
+        app.add_plugins(ConnectionPlugin);
+        let entity = app
+            .world_mut()
+            .spawn(Unlinked {
+                reason: UnlinkReason::ByPeer(String::from("server shutdown")),
+            })
+            .id();
+
+        app.update();
+
+        assert_eq!(
+            app.world().get::<Disconnected>(entity).unwrap().reason,
+            DisconnectedReason::LinkFailed(UnlinkReason::ByPeer(String::from("server shutdown")))
+        );
+    }
+}
